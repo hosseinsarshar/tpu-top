@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tpu-top"
+version = "0.1.0"
+description = "TPU Monitoring Dashboard TUI"
+requires-python = ">=3.8"
+dependencies = [
+    "rich",
+    "psutil",
+]
+
+[project.scripts]
+tpu-top = "tputop:main"
+
+[tool.setuptools]
+py-modules = ["tputop"]
