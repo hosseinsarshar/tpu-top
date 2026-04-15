@@ -297,11 +297,11 @@ def make_device_table(devices: List[Dict[str, Any]], hlo_map: Dict[int, Dict[int
 
 def make_process_table(processes: List[Dict[str, Any]]) -> Table:
     table = Table(box=box.ROUNDED, expand=True)
-    table.add_column("PID", justify="right", style="cyan")
-    table.add_column("Process", justify="left", style="green")
-    table.add_column("Device", justify="center", style="yellow")
-    table.add_column("%CPU", justify="right", style="blue")
-    table.add_column("Memory", justify="right", style="magenta")
+    table.add_column("PID", justify="right", style="cyan", ratio=20)
+    table.add_column("Process", justify="left", style="green", ratio=50)
+    table.add_column("Device", justify="center", style="yellow", ratio=10)
+    table.add_column("%CPU", justify="right", style="blue", ratio=10)
+    table.add_column("Memory", justify="right", style="magenta", ratio=10)
     
     for p in processes:
         mem_gb = p.get("memory", 0) / (1024**3)
@@ -325,7 +325,7 @@ def make_layout() -> Layout:
     layout.split(
         Layout(name="header", size=4),
         Layout(name="devices", size=12),
-        Layout(name="history", size=15),
+        Layout(name="history", size=14),
         Layout(name="processes", ratio=1)
     )
 
@@ -537,6 +537,19 @@ def main():
                 except Exception:
                     pass
 
+            # Filter and sort processes
+            current_pid = os.getpid()
+            processes = [p for p in processes if p["pid"] != current_pid]
+            processes = [p for p in processes if "tpu-top" not in p["name"] and "tputop" not in p["name"]]
+            
+            tpu_procs = [p for p in processes if "TPU" in p["device"]]
+            cpu_procs = [p for p in processes if p["device"] == "CPU"]
+            
+            tpu_procs.sort(key=lambda x: x["memory"], reverse=True)
+            cpu_procs.sort(key=lambda x: x["memory"], reverse=True)
+            
+            processes = tpu_procs + cpu_procs
+
             # Calculate averages for history
             avg_util = sum(d["duty_cycle"] for d in devices) / len(devices) if devices else 0
             avg_mem_pct = sum(d["memory_usage"] / d["total_memory"] * 100 for d in devices) / len(devices) if devices else 0
@@ -564,14 +577,65 @@ def main():
                 if hlo_lines_count == 0 and d["id"] != 0 and d["duty_cycle"] > 10 and 0 in hlo_map:
                     hlo_lines_count = len(hlo_map[0])
                 
-                row_height = max(1, hlo_lines_count)
+                row_height = max(2, hlo_lines_count)
                 dev_height += row_height + 1 # +1 for separator line
             
             dev_height += 2 # Panel border
             
-            # Cap it to leave space for other panels
-            max_allowed = max(5, console.height - 25)
-            layout["devices"].size = min(dev_height, max_allowed)
+            # Priority layout logic
+            header_h = 4
+            dev_target_h = dev_height
+            
+            # Try to accommodate everything with 2x2 grid and normal processes (5 lines)
+            if console.height >= header_h + 14 + 5 + dev_target_h:
+                is_grid = True
+                history_h = 14
+                proc_h = console.height - header_h - 14 - dev_target_h
+            # Try with 1-row grid and normal processes (5 lines)
+            elif console.height >= header_h + 7 + 5 + dev_target_h:
+                is_grid = False
+                history_h = 7
+                proc_h = console.height - header_h - 7 - dev_target_h
+            # Try with 1-row grid and min processes (3 lines)
+            elif console.height >= header_h + 7 + 3 + dev_target_h:
+                is_grid = False
+                history_h = 7
+                proc_h = 3
+            else:
+                # Screen is too small! Capping devices!
+                is_grid = False
+                history_h = 7
+                proc_h = 3
+                dev_target_h = max(5, console.height - header_h - history_h - proc_h)
+
+            # Apply calculated sizes
+            layout["history"].size = history_h
+            layout["processes"].size = proc_h
+            layout["devices"].size = dev_target_h
+
+            # Update history layout structure
+            if is_grid:
+                layout["history"].split_row(
+                    Layout(name="left_col", ratio=1),
+                    Layout(name="right_col", ratio=1)
+                )
+                layout["history"]["left_col"].split(
+                    Layout(name="cpu_graph"),
+                    Layout(name="ram_graph")
+                )
+                layout["history"]["right_col"].split(
+                    Layout(name="gpu_util_graph"),
+                    Layout(name="gpu_mem_graph")
+                )
+                col_width = console.width // 2
+            else:
+                layout["history"].split_row(
+                    Layout(name="cpu_graph"),
+                    Layout(name="ram_graph"),
+                    Layout(name="gpu_util_graph"),
+                    Layout(name="gpu_mem_graph")
+                )
+                col_width = console.width // 4
 
             # Update layout
             layout["devices"].update(Panel(make_device_table(devices, hlo_map), title="Devices", box=box.ROUNDED))
@@ -579,8 +643,6 @@ def main():
             # Update graphs with dynamic width and timeline
             # Google Corp Colors
             # Blue: #4285F4, Red: #EA4335, Yellow: #FBBC05, Green: #34A853
-            
-            col_width = console.width // 2
             graph_width = max(10, col_width - 6) # Subtract borders only!
             
             timeline_str = make_timeline(graph_width)
@@ -618,10 +680,16 @@ def main():
             util_text.append(timeline_str, style="dim")
 
             
-            layout["history"]["left_col"]["cpu_graph"].update(Panel(cpu_text, title="CPU Activity", box=box.ROUNDED, border_style="#4285F4"))
-            layout["history"]["left_col"]["ram_graph"].update(Panel(ram_text, title="RAM Activity", box=box.ROUNDED, border_style="#EA4335"))
-            layout["history"]["right_col"]["gpu_util_graph"].update(Panel(util_text, title="AVG TPU UTL", box=box.ROUNDED, border_style="#34A853"))
-            layout["history"]["right_col"]["gpu_mem_graph"].update(Panel(mem_text, title="AVG TPU MEM", box=box.ROUNDED, border_style="#FBBC05"))
+            if is_grid:
+                layout["history"]["left_col"]["cpu_graph"].update(Panel(cpu_text, title="CPU Activity", box=box.ROUNDED, border_style="#4285F4"))
+                layout["history"]["left_col"]["ram_graph"].update(Panel(ram_text, title="RAM Activity", box=box.ROUNDED, border_style="#EA4335"))
+                layout["history"]["right_col"]["gpu_util_graph"].update(Panel(util_text, title="AVG TPU UTL", box=box.ROUNDED, border_style="#34A853"))
+                layout["history"]["right_col"]["gpu_mem_graph"].update(Panel(mem_text, title="AVG TPU MEM", box=box.ROUNDED, border_style="#FBBC05"))
+            else:
+                layout["history"]["cpu_graph"].update(Panel(cpu_text, title="CPU Activity", box=box.ROUNDED, border_style="#4285F4"))
+                layout["history"]["ram_graph"].update(Panel(ram_text, title="RAM Activity", box=box.ROUNDED, border_style="#EA4335"))
+                layout["history"]["gpu_util_graph"].update(Panel(util_text, title="AVG TPU UTL", box=box.ROUNDED, border_style="#34A853"))
+                layout["history"]["gpu_mem_graph"].update(Panel(mem_text, title="AVG TPU MEM", box=box.ROUNDED, border_style="#FBBC05"))
 
             
             layout["processes"].update(Panel(make_process_table(processes), title="Processes", box=box.ROUNDED))
