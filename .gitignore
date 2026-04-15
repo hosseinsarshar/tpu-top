@@ -140,3 +140,6 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# Others
+commands.sh

@@ -565,7 +565,7 @@ def main():
             tpu_procs = [p for p in processes if "TPU" in p["device"]]
             cpu_procs = [p for p in processes if p["device"] == "CPU"]
             
-            tpu_procs.sort(key=lambda x: x["memory"], reverse=True)
+            tpu_procs.sort(key=lambda x: (int(x["device"].split()[1]), -x["memory"]))
             cpu_procs.sort(key=lambda x: x["memory"], reverse=True)
             
             processes = tpu_procs + cpu_procs
