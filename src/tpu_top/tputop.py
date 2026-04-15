@@ -235,7 +235,7 @@ def get_mock_processes() -> List[Dict[str, Any]]:
     return procs
 
 
-def make_device_table(devices: List[Dict[str, Any]], hlo_map: Dict[int, Dict[int, str]]) -> Table:
+def make_device_table(devices: List[Dict[str, Any]], hlo_map: Dict[int, Dict[int, str]], devices_per_chip: int) -> Table:
     table = Table(box=box.ROUNDED, expand=True, show_lines=True)
     
     term_width = console.width
@@ -275,16 +275,24 @@ def make_device_table(devices: List[Dict[str, Any]], hlo_map: Dict[int, Dict[int
                 for core_idx in sorted(hlo_dict_0.keys()):
                     loc = hlo_dict_0[core_idx]
                     if loc and loc != "N/A":
-                        hlo_lines.append(f"C{core_idx}*: {loc}")
+                        hlo_lines.append(f"C{core_idx}: {loc}")
                         
         hlo_op = "\n".join(hlo_lines) if hlo_lines else "N/A"
 
-        if term_width < 110:
-            mem_text = f"MEM: [{mem_bar}]\n{mem_pct:.0f}% ({mem_gb:.1f} GiB)"
-            util_text = f"UTL: [{util_bar}]\n{d['duty_cycle']:.0f}%"
+        if devices_per_chip <= 1:
+            if term_width < 110:
+                mem_text = f"MEM: [{mem_bar}] {mem_pct:.0f}% ({mem_gb:.1f} GiB)"
+                util_text = f"UTL: [{util_bar}] {d['duty_cycle']:.0f}%"
+            else:
+                mem_text = f"MEM: [{mem_bar}] {mem_pct:.1f}% ({mem_gb:.1f}/{total_gb:.1f} GiB)"
+                util_text = f"UTL: [{util_bar}] {d['duty_cycle']:.1f}%"
         else:
-            mem_text = f"MEM: [{mem_bar}]\n{mem_pct:.1f}% ({mem_gb:.1f}/{total_gb:.1f} GiB)"
-            util_text = f"UTL: [{util_bar}]\n{d['duty_cycle']:.1f}%"
+            if term_width < 110:
+                mem_text = f"MEM: [{mem_bar}]\n{mem_pct:.0f}% ({mem_gb:.1f} GiB)"
+                util_text = f"UTL: [{util_bar}]\n{d['duty_cycle']:.0f}%"
+            else:
+                mem_text = f"MEM: [{mem_bar}]\n{mem_pct:.1f}% ({mem_gb:.1f}/{total_gb:.1f} GiB)"
+                util_text = f"UTL: [{util_bar}]\n{d['duty_cycle']:.1f}%"
             
         table.add_row(
             f"TPU {d['id']}",
@@ -361,11 +369,7 @@ def main():
     
     use_mock = not HAS_TPU_INFO or os.environ.get("TPU_TOP_MOCK") == "1"
     
-    try:
-        import jax
-        jax_version = jax.__version__
-    except ImportError:
-        jax_version = "--"
+
         
     try:
         import libtpu
@@ -373,7 +377,17 @@ def main():
     except ImportError:
         libtpu_version = "--"
         
-    tpu_info_version = "--"
+    try:
+        import tpu_info
+        tpu_info_version = getattr(tpu_info, "__version__", None)
+        if not tpu_info_version:
+            import importlib.metadata
+            try:
+                tpu_info_version = importlib.metadata.version("tpu-info")
+            except importlib.metadata.PackageNotFoundError:
+                tpu_info_version = "--"
+    except ImportError:
+        tpu_info_version = "--"
     
     if use_mock:
         tpu_gen = "TPU Mock"
@@ -385,9 +399,15 @@ def main():
         except Exception:
             tpu_gen = "TPU Unknown"
 
+    try:
+        import importlib.metadata
+        tpu_top_version = importlib.metadata.version("tpu-top")
+    except (importlib.metadata.PackageNotFoundError, ImportError):
+        tpu_top_version = "0.1.1"
+
     # Fill header
     header_text = Text(f"TPU-TOP - TPU Utilization Monitor ({tpu_gen})", justify="center", style="bold green")
-    header_text.append(f"\nJAX: {jax_version} | libtpu: {libtpu_version} | tpu-info: {tpu_info_version}", style="dim")
+    header_text.append(f"\ntpu-top: {tpu_top_version} | libtpu: {libtpu_version} | tpu-info: {tpu_info_version}", style="dim")
     layout["header"].update(Panel(header_text, box=box.ROUNDED))
 
     
@@ -568,16 +588,20 @@ def main():
             # Calculate required height for devices table
             dev_height = 3 # Header and borders
             for d in devices:
-                hlo_dict = hlo_map.get(d["id"], {})
-                hlo_lines_count = 0
-                for core_idx in sorted(hlo_dict.keys()):
-                    loc = hlo_dict[core_idx]
-                    if loc and loc != "N/A":
-                        hlo_lines_count += 1
-                if hlo_lines_count == 0 and d["id"] != 0 and d["duty_cycle"] > 10 and 0 in hlo_map:
-                    hlo_lines_count = len(hlo_map[0])
+                if devices_per_chip <= 1:
+                    row_height = 1
+                else:
+                    hlo_dict = hlo_map.get(d["id"], {})
+                    hlo_lines_count = 0
+                    for core_idx in sorted(hlo_dict.keys()):
+                        loc = hlo_dict[core_idx]
+                        if loc and loc != "N/A":
+                            hlo_lines_count += 1
+                    if hlo_lines_count == 0 and d["id"] != 0 and d["duty_cycle"] > 10 and 0 in hlo_map:
+                        hlo_lines_count = len(hlo_map[0])
+                    
+                    row_height = max(2, hlo_lines_count)
                 
-                row_height = max(2, hlo_lines_count)
                 dev_height += row_height + 1 # +1 for separator line
             
             dev_height += 2 # Panel border
@@ -638,7 +662,7 @@ def main():
                 col_width = console.width // 4
 
             # Update layout
-            layout["devices"].update(Panel(make_device_table(devices, hlo_map), title="Devices", box=box.ROUNDED))
+            layout["devices"].update(Panel(make_device_table(devices, hlo_map, devices_per_chip), title="Devices", box=box.ROUNDED))
             
             # Update graphs with dynamic width and timeline
             # Google Corp Colors

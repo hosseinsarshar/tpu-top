@@ -6,7 +6,7 @@ A modern, terminal-based monitoring dashboard for Google Cloud TPUs, designed to
 
 `tpu-top` provides a visual, interactive TUI (Terminal User Interface) to monitor system and TPU resources. It is specifically tailored for high-performance computing environments like GKE (Google Kubernetes Engine) where deep learning models are trained on TPUs.
 
-![alt text](./images/main-ui.png)
+![tpu-top UI](./images/image.png)
 
 ### Key Features
 
