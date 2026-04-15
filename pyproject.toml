@@ -4,16 +4,32 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tpu-top"
-version = "0.1.0"
-description = "TPU Monitoring Dashboard TUI"
-requires-python = ">=3.8"
+version = "0.1.1"
+authors = [
+  { name="Hossein Sarshar", email="hossein.sarshar@gmail.com" },
+]
+description = "TPU Monitoring Dashboard"
+readme = "README.md"
+requires-python = ">=3.12"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
 dependencies = [
-    "rich",
+    "rich>",
     "psutil",
+    "tpu-info",
+    "jax[tpu]",
 ]
 
+[project.urls]
+"Homepage" = "https://github.com/hosseinsarshar/tpu-top"
+"Bug Tracker" = "https://github.com/hosseinsarshar/tpu-top/issues"
+
 [project.scripts]
-tpu-top = "tputop:main"
+tpu-top = "tpu_top.tputop:main"
 
 [tool.setuptools]
-py-modules = ["tputop"]
+packages = ["tpu_top"]
+package-dir = {"" = "src"}

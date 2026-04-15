@@ -1,5 +1,5 @@
 import unittest
-from tputop import sparkline, vertical_bar_chart, make_timeline
+from tpu_top.tputop import sparkline, vertical_bar_chart, make_timeline
 
 
 class TestTpuTop(unittest.TestCase):

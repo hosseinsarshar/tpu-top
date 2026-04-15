@@ -237,29 +237,35 @@ def get_mock_processes() -> List[Dict[str, Any]]:
 
 def make_device_table(devices: List[Dict[str, Any]], hlo_map: Dict[int, Dict[int, str]]) -> Table:
     table = Table(box=box.ROUNDED, expand=True, show_lines=True)
-    table.add_column("TPU", justify="center", style="cyan")
-    table.add_column("Memory Usage", justify="left", style="magenta")
-    table.add_column("Utilization", justify="left", style="green")
-    table.add_column("Current HLO Op / Core", justify="left", style="white")
+    
+    term_width = console.width
+    bar_len = 10 if term_width >= 120 else 5
+    
+    table.add_column("TPU", justify="center", style="cyan", ratio=10)
+    table.add_column("Memory Usage", justify="left", style="magenta", ratio=25, no_wrap=True, overflow="ellipsis")
+    table.add_column("Utilization", justify="left", style="green", ratio=25, no_wrap=True, overflow="ellipsis")
+    table.add_column("Current HLO Op / Core", justify="left", style="white", no_wrap=True, overflow="ellipsis", ratio=40)
     
     for d in devices:
         mem_gb = d["memory_usage"] / (1024**3)
         total_gb = d["total_memory"] / (1024**3)
         mem_pct = d["memory_usage"] / d["total_memory"] * 100 if d["total_memory"] > 0 else 0
         
-        mem_bar_len = int(mem_pct / 10)
-        mem_bar = "█" * mem_bar_len + " " * (10 - mem_bar_len)
+        mem_bar_len = int(mem_pct / (100 / bar_len))
+        if mem_bar_len == 0 and mem_pct > 0:
+            mem_bar_len = 1
+        mem_bar = "█" * mem_bar_len + " " * (bar_len - mem_bar_len)
         
-        util_bar_len = int(d["duty_cycle"] / 10)
-        util_bar = "█" * util_bar_len + " " * (10 - util_bar_len)
+        util_bar_len = int(d["duty_cycle"] / (100 / bar_len))
+        if util_bar_len == 0 and d["duty_cycle"] > 0:
+            util_bar_len = 1
+        util_bar = "█" * util_bar_len + " " * (bar_len - util_bar_len)
         
         hlo_dict = hlo_map.get(d["id"], {})
         hlo_lines = []
         for core_idx in sorted(hlo_dict.keys()):
             loc = hlo_dict[core_idx]
             if loc and loc != "N/A":
-                if len(loc) > 40:
-                    loc = loc[:37] + "..."
                 hlo_lines.append(f"C{core_idx}: {loc}")
         
         if not hlo_lines and d["id"] != 0:
@@ -269,18 +275,21 @@ def make_device_table(devices: List[Dict[str, Any]], hlo_map: Dict[int, Dict[int
                 for core_idx in sorted(hlo_dict_0.keys()):
                     loc = hlo_dict_0[core_idx]
                     if loc and loc != "N/A":
-                        if len(loc) > 35:
-                            loc = loc[:32] + "..."
                         hlo_lines.append(f"C{core_idx}*: {loc}")
                         
         hlo_op = "\n".join(hlo_lines) if hlo_lines else "N/A"
 
-
+        if term_width < 110:
+            mem_text = f"MEM: [{mem_bar}]\n{mem_pct:.0f}% ({mem_gb:.1f} GiB)"
+            util_text = f"UTL: [{util_bar}]\n{d['duty_cycle']:.0f}%"
+        else:
+            mem_text = f"MEM: [{mem_bar}]\n{mem_pct:.1f}% ({mem_gb:.1f}/{total_gb:.1f} GiB)"
+            util_text = f"UTL: [{util_bar}]\n{d['duty_cycle']:.1f}%"
             
         table.add_row(
             f"TPU {d['id']}",
-            f"MEM: [{mem_bar}] {mem_pct:.1f}% ({mem_gb:.1f}/{total_gb:.1f} GiB)",
-            f"UTL: [{util_bar}] {d['duty_cycle']:.1f}%",
+            mem_text,
+            util_text,
             hlo_op
         )
     return table
