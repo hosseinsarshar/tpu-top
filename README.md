@@ -11,14 +11,12 @@ A modern, terminal-based monitoring dashboard for Google Cloud TPUs, designed to
 
 ![tpu-top UI](https://raw.githubusercontent.com/hosseinsarshar/tpu-top/main/images/image.png)
 
-### Key Features
+### What You Can See
 
-*   **Responsive Layout**: Automatically switches between 2x2 grid and 1x4 list for graphs based on terminal height.
-*   **Priority-Based Rendering**: Dynamically shrinks or drops panels (Processes panel shrinks first) to fit severe vertical constraints.
-*   **Device Status Table**: Detailed per-device breakdown showing duty cycle and memory usage. Compact 1-line layout for single-core TPUs (v6e) and multi-line for multi-core (v7).
-*   **Process Monitor**: Lists active processes, prioritized by TPU processes (sorted by TPU index) and then CPU processes (sorted by memory usage).
-*   **Google Brand Styling**: Color-coded graphs using Google's signature color palette (Blue, Red, Yellow, Green).
-*   **Version Awareness**: Displays `tpu-top`, `libtpu`, and `tpu-info` versions directly in the header alongside detected TPU generation.
+*   **TPU Memory & Utilization**: Real-time memory usage and duty cycle for each TPU device.
+*   **History Timebars**: Visual graphs with timeline markers showing the history of CPU, RAM, and TPU usage.
+*   **PIDs per TPU**: A dedicated process list showing which PIDs are utilizing specific TPU devices.
+*   **Active HLO Ops**: Current HLO operations executing on each TPU core.
 
 ## Installation
 
@@ -59,11 +57,6 @@ Once installed, you can launch the dashboard from anywhere in your terminal:
 ```bash
 tpu-top
 ```
-
-### Environment Variables
-
-*   `TPU_TOP_MOCK=1`: Force mock mode for testing on machines without physical TPUs.
-*   `TPU_TOP_ITERATIONS=N`: Run for exactly `N` refresh cycles and exit (useful for automated tests).
 
 ## Running Tests
 
