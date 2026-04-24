@@ -177,6 +177,7 @@ cpu_history = []
 ram_history = []
 tpu_util_history = []
 tpu_mem_history = []
+tpu_duty_cycle_history = []
 
 
 
@@ -239,11 +240,16 @@ def make_device_table(devices: List[Dict[str, Any]], hlo_map: Dict[int, Dict[int
     table = Table(box=box.ROUNDED, expand=True, show_lines=True)
     
     term_width = console.width
-    bar_len = 10 if term_width >= 120 else 5
+    # Estimate column width based on 20% ratio and overhead (borders, padding, fixed columns)
+    avail_col_width = int((term_width - 25) * 0.20)
     
-    table.add_column("TPU", justify="center", style="cyan", ratio=10)
-    table.add_column("Memory Usage", justify="left", style="magenta", ratio=25, no_wrap=True, overflow="ellipsis")
-    table.add_column("Utilization", justify="left", style="green", ratio=25, no_wrap=True, overflow="ellipsis")
+    # Bar is on its own line, maximize it
+    bar_len = max(5, avail_col_width - 7)
+    
+    table.add_column("TPU", justify="center", style="cyan", width=7)
+    table.add_column("Memory Usage", justify="left", style="bold #FBBC05", ratio=20, no_wrap=True, overflow="ellipsis")
+    table.add_column("TC Utilization", justify="left", style="bold #34A853", ratio=20, no_wrap=True, overflow="ellipsis")
+    table.add_column("Duty Cycle", justify="left", style="bold #E066FF", ratio=20, no_wrap=True, overflow="ellipsis")
     table.add_column("Current HLO Op / Core", justify="left", style="white", no_wrap=True, overflow="ellipsis", ratio=40)
     
     for d in devices:
@@ -251,26 +257,37 @@ def make_device_table(devices: List[Dict[str, Any]], hlo_map: Dict[int, Dict[int
         total_gb = d["total_memory"] / (1024**3)
         mem_pct = d["memory_usage"] / d["total_memory"] * 100 if d["total_memory"] > 0 else 0
         
-        mem_bar_len = int(mem_pct / (100 / bar_len))
-        if mem_bar_len == 0 and mem_pct > 0:
-            mem_bar_len = 1
+        mem_bar_len = round(mem_pct / (100 / bar_len))
+        mem_bar_len = max(0, min(bar_len, mem_bar_len))
         mem_bar = "█" * mem_bar_len + " " * (bar_len - mem_bar_len)
         
-        util_bar_len = int(d["duty_cycle"] / (100 / bar_len))
-        if util_bar_len == 0 and d["duty_cycle"] > 0:
-            util_bar_len = 1
+        util_bar_len = round(d["tensorcore_util"] / (100 / bar_len))
+        util_bar_len = max(0, min(bar_len, util_bar_len))
         util_bar = "█" * util_bar_len + " " * (bar_len - util_bar_len)
+        
+        dc_bar_len = round(d["duty_cycle"] / (100 / bar_len))
+        dc_bar_len = max(0, min(bar_len, dc_bar_len))
+        dc_bar = "█" * dc_bar_len + " " * (bar_len - dc_bar_len)
         
         hlo_dict = hlo_map.get(d["id"], {})
         hlo_lines = []
-        for core_idx in sorted(hlo_dict.keys()):
-            loc = hlo_dict[core_idx]
-            if loc and loc != "N/A":
-                hlo_lines.append(f"C{core_idx}: {loc}")
+        
+        # Always ensure Tensor Cores are present based on devices_per_chip
+        for i in range(devices_per_chip):
+            label = f"TC{i}"
+            loc = hlo_dict.get(label, "N/A")
+            hlo_lines.append(f"{label}: {loc}")
+            
+        # Also add any other keys (like Sparse Cores) that were discovered and have valid info
+        for label in sorted(hlo_dict.keys()):
+            if not label.startswith("TC"):
+                loc = hlo_dict[label]
+                if loc and loc != "N/A":
+                    hlo_lines.append(f"{label}: {loc}")
         
         if not hlo_lines and d["id"] != 0:
             # Fallback to TPU 0 if this TPU is utilized but has no HLO info
-            if d["duty_cycle"] > 10 and 0 in hlo_map:
+            if d["tensorcore_util"] > 10 and 0 in hlo_map:
                 hlo_dict_0 = hlo_map[0]
                 for core_idx in sorted(hlo_dict_0.keys()):
                     loc = hlo_dict_0[core_idx]
@@ -279,25 +296,20 @@ def make_device_table(devices: List[Dict[str, Any]], hlo_map: Dict[int, Dict[int
                         
         hlo_op = "\n".join(hlo_lines) if hlo_lines else "N/A"
 
-        if devices_per_chip <= 1:
-            if term_width < 110:
-                mem_text = f"MEM: [{mem_bar}] {mem_pct:.0f}% ({mem_gb:.1f} GiB)"
-                util_text = f"UTL: [{util_bar}] {d['duty_cycle']:.0f}%"
-            else:
-                mem_text = f"MEM: [{mem_bar}] {mem_pct:.1f}% ({mem_gb:.1f}/{total_gb:.1f} GiB)"
-                util_text = f"UTL: [{util_bar}] {d['duty_cycle']:.1f}%"
+        if term_width < 110:
+            mem_text = f"MEM: [{mem_bar}]\n{mem_pct:.0f}% ({mem_gb:.1f} GiB)"
+            util_text = f"UTL: [{util_bar}]\n{d['tensorcore_util']:.0f}%"
+            dc_text = f"DC:  [{dc_bar}]\n{d['duty_cycle']:.0f}%"
         else:
-            if term_width < 110:
-                mem_text = f"MEM: [{mem_bar}]\n{mem_pct:.0f}% ({mem_gb:.1f} GiB)"
-                util_text = f"UTL: [{util_bar}]\n{d['duty_cycle']:.0f}%"
-            else:
-                mem_text = f"MEM: [{mem_bar}]\n{mem_pct:.1f}% ({mem_gb:.1f}/{total_gb:.1f} GiB)"
-                util_text = f"UTL: [{util_bar}]\n{d['duty_cycle']:.1f}%"
+            mem_text = f"MEM: [{mem_bar}]\n{mem_pct:.1f}% ({mem_gb:.1f}/{total_gb:.1f} GiB)"
+            util_text = f"UTL: [{util_bar}]\n{d['tensorcore_util']:.0f}%"
+            dc_text = f"DC:  [{dc_bar}]\n{d['duty_cycle']:.0f}%"
             
         table.add_row(
             f"TPU {d['id']}",
             mem_text,
             util_text,
+            dc_text,
             hlo_op
         )
     return table
@@ -305,11 +317,11 @@ def make_device_table(devices: List[Dict[str, Any]], hlo_map: Dict[int, Dict[int
 
 def make_process_table(processes: List[Dict[str, Any]]) -> Table:
     table = Table(box=box.ROUNDED, expand=True)
-    table.add_column("PID", justify="right", style="cyan", ratio=20)
-    table.add_column("Process", justify="left", style="green", ratio=50)
-    table.add_column("Device", justify="center", style="yellow", ratio=10)
-    table.add_column("%CPU", justify="right", style="blue", ratio=10)
-    table.add_column("Memory", justify="right", style="magenta", ratio=10)
+    table.add_column("PID", justify="right", style="cyan", width=10)
+    table.add_column("Process", justify="left", style="green", ratio=1)
+    table.add_column("Device", justify="center", style="yellow", width=10)
+    table.add_column("%CPU", justify="right", style="blue", width=7)
+    table.add_column("RAM", justify="right", style="magenta", width=14)
     
     for p in processes:
         mem_gb = p.get("memory", 0) / (1024**3)
@@ -414,6 +426,7 @@ def main():
     iterations = int(os.environ.get("TPU_TOP_ITERATIONS", "0"))
     iter_count = 0
     
+    process_cache = {}
     with Live(layout, refresh_per_second=2, screen=True):
         while True:
             if iterations > 0 and iter_count >= iterations:
@@ -471,7 +484,17 @@ def main():
                             loc = cs.sequencer_states[0].hlo_location or "N/A"
                             if cs.chip_id not in hlo_map:
                                 hlo_map[cs.chip_id] = {}
-                            hlo_map[cs.chip_id][cs.core_on_chip_index] = loc
+                            
+                            # Distinguish between Tensor Core and Sparse Core to prevent overwriting
+                            core_type = cs.core_type
+                            if 'TENSOR_CORE' in core_type:
+                                core_label = f"TC{cs.core_on_chip_index}"
+                            elif 'SPARSE_CORE' in core_type:
+                                core_label = f"SC{cs.core_on_chip_index}"
+                            else:
+                                core_label = f"C{cs.core_on_chip_index}"
+                                
+                            hlo_map[cs.chip_id][core_label] = loc
                 except Exception:
                     pass
                 
@@ -483,7 +506,8 @@ def main():
                     total_mem = u.total_memory if u else 1
                     
                     # Aggregate TensorCore util for this chip
-                    util = u.duty_cycle_pct if u else 0.0
+                    raw_duty_cycle = u.duty_cycle_pct if u else 0.0
+                    util = raw_duty_cycle
                     if tensorcore_util_data:
                         core_utils = []
                         for c in range(devices_per_chip):
@@ -500,7 +524,8 @@ def main():
                         "id": i,
                         "memory_usage": mem_usage,
                         "total_memory": total_mem,
-                        "duty_cycle": util,
+                        "duty_cycle": raw_duty_cycle,
+                        "tensorcore_util": util,
                         "temperature": 0
                     })
                 
@@ -516,9 +541,30 @@ def main():
                 for dev_path, pid in owners.items():
                     chip_idx = path_to_chip_idx.get(dev_path, -1)
                     try:
-                        proc = psutil.Process(pid)
-                        cpu_pct = proc.cpu_percent(interval=None)
-                        mem_info = proc.memory_info()
+                        if pid not in process_cache:
+                            proc = psutil.Process(pid)
+                            process_cache[pid] = {
+                                'proc': proc,
+                                'prev_time': time.time(),
+                                'prev_cpu': sum(proc.cpu_times()[:2])
+                            }
+                            cpu_pct = 0.0
+                        else:
+                            cache_entry = process_cache[pid]
+                            curr_time = time.time()
+                            curr_cpu = sum(cache_entry['proc'].cpu_times()[:2])
+                            
+                            time_diff = curr_time - cache_entry['prev_time']
+                            cpu_diff = curr_cpu - cache_entry['prev_cpu']
+                            
+                            if time_diff > 0.1:
+                                cpu_pct = (cpu_diff / time_diff) * 100
+                                cache_entry['prev_time'] = curr_time
+                                cache_entry['prev_cpu'] = curr_cpu
+                            else:
+                                cpu_pct = 0.0
+                                
+                        mem_info = process_cache[pid]['proc'].memory_info()
                         mem_rss = mem_info.rss if mem_info else 0
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         cpu_pct = 0.0
@@ -534,13 +580,35 @@ def main():
                     
                 # Add top CPU processes
                 try:
-                    for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_info']):
+                    for proc in psutil.process_iter(['pid', 'name', 'memory_info']):
                         try:
                             pid = proc.info['pid']
                             if pid in tpu_pids:
                                 continue # Already added as TPU process
                                 
-                            cpu_pct = proc.info['cpu_percent']
+                            if pid not in process_cache:
+                                proc_obj = psutil.Process(pid)
+                                process_cache[pid] = {
+                                    'proc': proc_obj,
+                                    'prev_time': time.time(),
+                                    'prev_cpu': sum(proc_obj.cpu_times()[:2])
+                                }
+                                cpu_pct = 0.0
+                            else:
+                                cache_entry = process_cache[pid]
+                                curr_time = time.time()
+                                curr_cpu = sum(cache_entry['proc'].cpu_times()[:2])
+                                
+                                time_diff = curr_time - cache_entry['prev_time']
+                                cpu_diff = curr_cpu - cache_entry['prev_cpu']
+                                
+                                if time_diff > 0.1:
+                                    cpu_pct = (cpu_diff / time_diff) * 100
+                                    cache_entry['prev_time'] = curr_time
+                                    cache_entry['prev_cpu'] = curr_cpu
+                                else:
+                                    cpu_pct = 0.0
+                                
                             if cpu_pct and cpu_pct > 1.0: # Only show if > 1% CPU
                                 mem_info = proc.info['memory_info']
                                 mem_rss = mem_info.rss if mem_info else 0
@@ -571,11 +639,13 @@ def main():
             processes = tpu_procs + cpu_procs
 
             # Calculate averages for history
-            avg_util = sum(d["duty_cycle"] for d in devices) / len(devices) if devices else 0
+            avg_util = sum(d["tensorcore_util"] for d in devices) / len(devices) if devices else 0
+            avg_duty_cycle = sum(d["duty_cycle"] for d in devices) / len(devices) if devices else 0
             avg_mem_pct = sum(d["memory_usage"] / d["total_memory"] * 100 for d in devices) / len(devices) if devices else 0
             
             tpu_util_history.append(avg_util)
             tpu_mem_history.append(avg_mem_pct)
+            tpu_duty_cycle_history.append(avg_duty_cycle)
             
             # Limit history to 240 items (120s at 0.5s interval)
             if len(tpu_util_history) > 240:
@@ -584,6 +654,8 @@ def main():
                 tpu_mem_history.pop(0)
             if len(cpu_history) > 240:
                 cpu_history.pop(0)
+            if len(tpu_duty_cycle_history) > 240:
+                tpu_duty_cycle_history.pop(0)
             
             # Calculate required height for devices table
             dev_height = 3 # Header and borders
@@ -611,10 +683,11 @@ def main():
             dev_target_h = dev_height
             
             # Try to accommodate everything with 2x2 grid and normal processes (5 lines)
-            if console.height >= header_h + 14 + 5 + dev_target_h:
+            # Try to accommodate everything with 2x2+1 grid and normal processes (5 lines)
+            if console.height >= header_h + 21 + 5 + dev_target_h:
                 is_grid = True
-                history_h = 14
-                proc_h = console.height - header_h - 14 - dev_target_h
+                history_h = 21
+                proc_h = console.height - header_h - 21 - dev_target_h
             # Try with 1-row grid and normal processes (5 lines)
             elif console.height >= header_h + 7 + 5 + dev_target_h:
                 is_grid = False
@@ -639,27 +712,34 @@ def main():
 
             # Update history layout structure
             if is_grid:
-                layout["history"].split_row(
+                # Long case: 2x2 grid + 1 panel below it
+                layout["history"].split(
+                    Layout(name="grid", ratio=2),
+                    Layout(name="duty_cycle_graph", ratio=1)
+                )
+                layout["history"]["grid"].split_row(
                     Layout(name="left_col", ratio=1),
                     Layout(name="right_col", ratio=1)
                 )
-                layout["history"]["left_col"].split(
+                layout["history"]["grid"]["left_col"].split(
                     Layout(name="cpu_graph"),
                     Layout(name="ram_graph")
                 )
-                layout["history"]["right_col"].split(
+                layout["history"]["grid"]["right_col"].split(
                     Layout(name="gpu_util_graph"),
                     Layout(name="gpu_mem_graph")
                 )
                 col_width = console.width // 2
             else:
+                # Small case: 1x5 row
                 layout["history"].split_row(
                     Layout(name="cpu_graph"),
                     Layout(name="ram_graph"),
                     Layout(name="gpu_util_graph"),
-                    Layout(name="gpu_mem_graph")
+                    Layout(name="gpu_mem_graph"),
+                    Layout(name="duty_cycle_graph")
                 )
-                col_width = console.width // 4
+                col_width = console.width // 5
 
             # Update layout
             layout["devices"].update(Panel(make_device_table(devices, hlo_map, devices_per_chip), title="Devices", box=box.ROUNDED))
@@ -672,7 +752,11 @@ def main():
             timeline_str = make_timeline(graph_width)
             
             # CPU (Blue)
-            cpu_prefix = f"CPU: {cpu_usage:5.1f}%"
+            if is_grid:
+                cpu_count = psutil.cpu_count() or 1
+                cpu_prefix = f"CPU: {cpu_usage:5.1f}% ({cpu_count} Cores)"
+            else:
+                cpu_prefix = f"CPU: {cpu_usage:5.1f}%"
             cpu_bars = vertical_bar_chart(cpu_history, width=graph_width, height=3)
             cpu_text = Text(cpu_prefix, style="bold #4285F4") + Text("\n")
             for line in cpu_bars:
@@ -680,7 +764,12 @@ def main():
             cpu_text.append(timeline_str, style="dim")
             
             # RAM (Red)
-            ram_prefix = f"RAM: {ram_usage['percent']:5.1f}%"
+            if is_grid:
+                ram_used_gb = ram_usage['used'] / (1024**3)
+                ram_total_gb = ram_usage['total'] / (1024**3)
+                ram_prefix = f"RAM: {ram_usage['percent']:5.1f}% ({ram_used_gb:.1f}/{ram_total_gb:.1f} GiB)"
+            else:
+                ram_prefix = f"RAM: {ram_usage['percent']:5.1f}%"
             ram_bars = vertical_bar_chart(ram_history, width=graph_width, height=3)
             ram_text = Text(ram_prefix, style="bold #EA4335") + Text("\n")
             for line in ram_bars:
@@ -703,17 +792,33 @@ def main():
                 util_text.append(line + "\n", style="#34A853")
             util_text.append(timeline_str, style="dim")
 
+            if is_grid:
+                dc_graph_width = max(10, console.width - 6)
+                dc_timeline_str = make_timeline(dc_graph_width)
+            else:
+                dc_graph_width = graph_width
+                dc_timeline_str = timeline_str
+                
+            # TPU Duty Cycle (Magenta)
+            dc_prefix = f"DC: {avg_duty_cycle:5.1f}%"
+            dc_bars = vertical_bar_chart(tpu_duty_cycle_history, width=dc_graph_width, height=3)
+            dc_text = Text(dc_prefix, style="bold #E066FF") + Text("\n")
+            for line in dc_bars:
+                dc_text.append(line + "\n", style="#E066FF")
+            dc_text.append(dc_timeline_str, style="dim")
             
             if is_grid:
-                layout["history"]["left_col"]["cpu_graph"].update(Panel(cpu_text, title="CPU Activity", box=box.ROUNDED, border_style="#4285F4"))
-                layout["history"]["left_col"]["ram_graph"].update(Panel(ram_text, title="RAM Activity", box=box.ROUNDED, border_style="#EA4335"))
-                layout["history"]["right_col"]["gpu_util_graph"].update(Panel(util_text, title="AVG TPU UTL", box=box.ROUNDED, border_style="#34A853"))
-                layout["history"]["right_col"]["gpu_mem_graph"].update(Panel(mem_text, title="AVG TPU MEM", box=box.ROUNDED, border_style="#FBBC05"))
+                layout["history"]["grid"]["left_col"]["cpu_graph"].update(Panel(cpu_text, title="CPU Activity", box=box.ROUNDED, border_style="#4285F4"))
+                layout["history"]["grid"]["left_col"]["ram_graph"].update(Panel(ram_text, title="RAM Activity", box=box.ROUNDED, border_style="#EA4335"))
+                layout["history"]["grid"]["right_col"]["gpu_util_graph"].update(Panel(util_text, title="AVG TPU (TC) UTL", box=box.ROUNDED, border_style="#34A853"))
+                layout["history"]["grid"]["right_col"]["gpu_mem_graph"].update(Panel(mem_text, title="AVG TPU Mem", box=box.ROUNDED, border_style="#FBBC05"))
+                layout["history"]["duty_cycle_graph"].update(Panel(dc_text, title="AVG TPU DUTY CYCLE", box=box.ROUNDED, border_style="#E066FF"))
             else:
                 layout["history"]["cpu_graph"].update(Panel(cpu_text, title="CPU Activity", box=box.ROUNDED, border_style="#4285F4"))
                 layout["history"]["ram_graph"].update(Panel(ram_text, title="RAM Activity", box=box.ROUNDED, border_style="#EA4335"))
                 layout["history"]["gpu_util_graph"].update(Panel(util_text, title="AVG TPU UTL", box=box.ROUNDED, border_style="#34A853"))
                 layout["history"]["gpu_mem_graph"].update(Panel(mem_text, title="AVG TPU MEM", box=box.ROUNDED, border_style="#FBBC05"))
+                layout["history"]["duty_cycle_graph"].update(Panel(dc_text, title="AVG TPU DUTY CYCLE", box=box.ROUNDED, border_style="#E066FF"))
 
             
             layout["processes"].update(Panel(make_process_table(processes), title="Processes", box=box.ROUNDED))
