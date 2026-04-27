@@ -1,6 +1,6 @@
 # TPU-TOP
 
-A modern, terminal-based monitoring dashboard for Google Cloud TPUs, designed to give you real-time visibility into your machine's performance.
+A simple terminal-based monitoring dashboard for Google Cloud TPUs, designed to give you real-time visibility into your machine's performance both on the host and the device.
 
 > [!NOTE]
 > This tool was inspired by the [nvitop](https://github.com/XuehaiPan/nvitop) project for GPUs. This is a community project and not an official Google product.
@@ -10,9 +10,11 @@ A modern, terminal-based monitoring dashboard for Google Cloud TPUs, designed to
 
 ## Project Overview
 
-`tpu-top` provides a visual, interactive TUI (Terminal User Interface) to monitor system and TPU resources. It is specifically tailored for high-performance computing environments like GKE (Google Kubernetes Engine) where deep learning models are trained on TPUs.
+`tpu-top` provides a visual, TUI (Terminal User Interface) to monitor system and TPU resources. It is tailored to run it directly on a TPU instance either on a GCE VM or a GKE Pod.
 
 ![tpu-top UI](https://raw.githubusercontent.com/hosseinsarshar/tpu-top/main/images/image.png)
+
+
 
 ### What You Can See
 
@@ -24,11 +26,28 @@ A modern, terminal-based monitoring dashboard for Google Cloud TPUs, designed to
 
 ## Calculations Explained
 
-### TensorCore Utilization
-This metric measures the percentage of time the Tensor Cores on the TPU chip were actively executing a program. It is read from the `libtpu` library (if available). If `libtpu` metrics are not available, it falls back to reporting the raw duty cycle.
-
 ### Duty Cycle
-This metric measures the active execution time of the TPU chip as reported by the TPU driver via the `tpu-info` library. It represents the overall proportion of time the accelerator was busy, regardless of whether it was executing massive matrix multiplications or standard operations.
+**Duty Cycle** represents the percentage of time the TPU is "busy" (not idle) during a given sampling window. 
+
+Performance Insights:
+- High Duty Cycle (e.g., >90%): The TPU is constantly running kernels and is not waiting on the host.
+- Low Duty Cycle (e.g., <30%): This is often a sign of "data starvation." The TPU is idle because it is waiting for the CPU to provide input data.
+
+### TensorCore Utilization
+TensorCore Utilization measures the computational intensity of the workload. It tracks what percentage of the TPU's peak theoretical matrix-multiplication capacity is actually being used while the chip is active.
+
+Performance Insights:
+- Low TensorCore Utilization: If your Duty Cycle is high but your TensorCore Utilization is low, your TPU is "busy," but it isn't doing much math. This often occurs when:
+  - Batch sizes are too small to saturate the hardware.
+  - The model is limited by memory bandwidth rather than compute.
+  - The code spends a lot of time on non-matrix operations (e.g., scalar transposes).
+
+
+### How to use them together
+- **Low Duty Cycle + Low TensorCore Util:** Your TPU is mostly idle, likely waiting for data from the CPU.
+- **High Duty Cycle + Low TensorCore Util:** Your TPU is constantly working, but the specific operations (kernels) you are running are not computationally dense (likely memory-bound or using small batch sizes).
+- **High Duty Cycle + High TensorCore Util:** Ideal performance; you are keeping the TPU busy and fully utilizing its matrix-multiplication hardware.
+
 
 ## Installation
 

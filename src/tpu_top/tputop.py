@@ -272,7 +272,15 @@ def make_device_table(devices: List[Dict[str, Any]], hlo_map: Dict[int, Dict[int
         hlo_dict = hlo_map.get(d["id"], {})
         hlo_lines = []
         
-        # Always ensure Tensor Cores are present based on devices_per_chip
+        # Check if we actually found any real HLO operations
+        has_real_hlo = any(loc and loc != "N/A" for loc in hlo_dict.values())
+        
+        if not has_real_hlo and d["id"] != 0:
+            # Fallback to TPU 0 if this TPU is utilized but has no HLO info
+            if d["tensorcore_util"] > 10 and 0 in hlo_map:
+                hlo_dict = hlo_map[0]
+                
+        # Now populate the lines
         for i in range(devices_per_chip):
             label = f"TC{i}"
             loc = hlo_dict.get(label, "N/A")
@@ -284,15 +292,6 @@ def make_device_table(devices: List[Dict[str, Any]], hlo_map: Dict[int, Dict[int
                 loc = hlo_dict[label]
                 if loc and loc != "N/A":
                     hlo_lines.append(f"{label}: {loc}")
-        
-        if not hlo_lines and d["id"] != 0:
-            # Fallback to TPU 0 if this TPU is utilized but has no HLO info
-            if d["tensorcore_util"] > 10 and 0 in hlo_map:
-                hlo_dict_0 = hlo_map[0]
-                for core_idx in sorted(hlo_dict_0.keys()):
-                    loc = hlo_dict_0[core_idx]
-                    if loc and loc != "N/A":
-                        hlo_lines.append(f"C{core_idx}: {loc}")
                         
         hlo_op = "\n".join(hlo_lines) if hlo_lines else "N/A"
 
