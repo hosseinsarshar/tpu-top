@@ -12,7 +12,7 @@ A simple terminal-based monitoring dashboard for Google Cloud TPUs, designed to 
 
 `tpu-top` provides a visual, TUI (Terminal User Interface) to monitor system and TPU resources. It is tailored to run it directly on a TPU instance either on a GCE VM or a GKE Pod.
 
-![tpu-top UI](https://raw.githubusercontent.com/hosseinsarshar/tpu-top/main/images/image.png)
+![tpu-top UI](https://raw.githubusercontent.com/hosseinsarshar/tpu-top/refs/heads/main/images/image.png)
 
 
 
