@@ -134,9 +134,6 @@ class MetricsCollector:
 
     def collect_metrics(self) -> Dict[str, Any]:
         """Collect all metrics."""
-        cpu_usage = self.get_cpu_usage()
-        ram_usage = self.get_ram_usage()
-        
         hlo_map = {}
         devices = []
         processes = []
@@ -144,9 +141,13 @@ class MetricsCollector:
         if self.use_mock:
             devices = self.get_mock_metrics()
             processes = self.get_mock_processes()
+            cpu_usage = random.uniform(40.0, 80.0)
+            ram_usage = {"percent": random.uniform(60.0, 90.0), "total": 1000 * 1024**3, "used": 700 * 1024**3}
             devices_per_chip = 1
             num_chips = len(devices)
         else:
+            cpu_usage = self.get_cpu_usage()
+            ram_usage = self.get_ram_usage()
             if not HAS_TPU_INFO:
                 raise RuntimeError("tpu-info is not available")
                 

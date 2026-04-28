@@ -97,7 +97,7 @@ def make_device_table(devices: List[Dict[str, Any]], hlo_map: Dict[int, Dict[int
     
     term_width = console.width
     avail_col_width = int((term_width - 25) * 0.20)
-    bar_len = max(5, avail_col_width - 7)
+    bar_len = max(0, avail_col_width - 7)
     
     table.add_column("TPU", justify="center", style="cyan", width=7)
     table.add_column("Memory Usage", justify="left", style="bold #FBBC05", ratio=20, no_wrap=True, overflow="ellipsis")
