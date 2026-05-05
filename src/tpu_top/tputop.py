@@ -105,7 +105,7 @@ class TpuTopApp(App):
             import importlib.metadata
             self.tpu_top_version = importlib.metadata.version("tpu-top")
         except (importlib.metadata.PackageNotFoundError, ImportError):
-            self.tpu_top_version = "0.1.7"
+            self.tpu_top_version = "--"
 
         self.tpu_topology = os.environ.get("TPU_ACCELERATOR_TYPE")
         if self.tpu_topology:
@@ -159,7 +159,7 @@ class TpuTopApp(App):
         # Update Banner
         header_text = Text(f"TPU-TOP - TPU Utilization Monitor ({self.tpu_topology})", justify="center", style="bold green")
         header_text.append(f"\ntpu-top: {self.tpu_top_version} | libtpu: {self.libtpu_version} | tpu-info: {self.tpu_info_version}", style="dim")
-                
+        
         self.query_one("#header-container", Static).update(Panel(header_text, box=box.ROUNDED))
 
         # Update Devices Table
