@@ -2,6 +2,7 @@ import os
 import time
 import asyncio
 from typing import Dict, Any
+import psutil
 
 from textual.app import App, ComposeResult
 from textual.widgets import Footer, Static
@@ -124,14 +125,26 @@ class TpuTopApp(App):
         self.collect_metrics_worker()
 
     @work(thread=True)
-    async def collect_metrics_worker(self) -> None:
-        while True:
+    def collect_metrics_worker(self) -> None:
+        while self.is_running:
             try:
                 metrics_data = self.collector.collect_metrics()
                 self.call_from_thread(self.update_ui, metrics_data)
             except Exception as e:
                 pass
-            await asyncio.sleep(0.5)
+            time.sleep(0.5)
+
+    def _update_graph(self, widget_id: str, panel_title: str, header_str: str, history_data: list, color: str, width: int, timeline: str):
+        """Helper to update a graph panel to avoid repeated logic."""
+        bars = vertical_bar_chart(history_data, width=width, height=3)
+        text = Text(header_str, style=f"bold {color}")
+        for line in bars:
+            text.append(line + "\n", style=color)
+        text.append(timeline, style=color)
+        
+        self.query_one(widget_id, Static).update(
+            Panel(text, title=panel_title, box=box.ROUNDED, border_style=color)
+        )
 
     def update_ui(self, metrics_data: Dict[str, Any]) -> None:
         # Update history
@@ -139,9 +152,12 @@ class TpuTopApp(App):
         self.history.append_ram(metrics_data["ram_usage"]["percent"])
         
         devices = metrics_data["devices"]
+        num_devices = len(devices)
         avg_util = sum(d["tensorcore_util"] for d in devices) / len(devices) if devices else 0
         avg_duty_cycle = sum(d["duty_cycle"] for d in devices) / len(devices) if devices else 0
         avg_mem_pct = sum(d["memory_usage"] / d["total_memory"] * 100 for d in devices) / len(devices) if devices else 0
+        total_hbm_gb = sum(d["total_memory"] for d in devices) / (1024**3) if devices else 0.0
+        total_ram_gb = metrics_data['ram_usage']['total'] / (1024**3)
         
         self.history.append_tpu_util(avg_util)
         self.history.append_tpu_mem(avg_mem_pct)
@@ -171,36 +187,17 @@ class TpuTopApp(App):
         timeline_str = make_timeline(graph_width)
 
         # CPU
-        cpu_bars = vertical_bar_chart(self.history.cpu, width=graph_width, height=3)
-        cpu_text = Text(f"CPU: {metrics_data['cpu_usage']:5.1f}%\n", style="bold #4285F4")
-        for line in cpu_bars:
-            cpu_text.append(line + "\n", style="#4285F4")
-        cpu_text.append(timeline_str, style="#4285F4")
-        self.query_one("#cpu-graph", Static).update(Panel(cpu_text, title="CPU Activity", box=box.ROUNDED, border_style="#4285F4"))
-
+        cpu_count = psutil.cpu_count() or 1
+        self._update_graph("#cpu-graph", "AVG CPU Activity", f"CPU ({cpu_count} cores): {metrics_data['cpu_usage']:5.1f}%\n", self.history.cpu, "#4285F4", graph_width, timeline_str)
+        
         # TPU Util
-        util_bars = vertical_bar_chart(self.history.tpu_util, width=graph_width, height=3)
-        util_text = Text(f"UTL: {avg_util:5.1f}%\n", style="bold #34A853")
-        for line in util_bars:
-            util_text.append(line + "\n", style="#34A853")
-        util_text.append(timeline_str, style="#34A853")
-        self.query_one("#tpu-util-graph", Static).update(Panel(util_text, title="AVG TPU (TC) UTL", box=box.ROUNDED, border_style="#34A853"))
-
+        self._update_graph("#tpu-util-graph", "AVG TPU (TC) UTL", f"UTL ({num_devices} Chips): {avg_util:5.1f}%\n", self.history.tpu_util, "#34A853", graph_width, timeline_str)
+        
         # RAM
-        ram_bars = vertical_bar_chart(self.history.ram, width=graph_width, height=3)
-        ram_text = Text(f"RAM: {metrics_data['ram_usage']['percent']:5.1f}%\n", style="bold #EA4335")
-        for line in ram_bars:
-            ram_text.append(line + "\n", style="#EA4335")
-        ram_text.append(timeline_str, style="#EA4335")
-        self.query_one("#ram-graph", Static).update(Panel(ram_text, title="RAM Activity", box=box.ROUNDED, border_style="#EA4335"))
-
+        self._update_graph("#ram-graph", "RAM Usage", f"RAM ({total_ram_gb:.1f} GB): {metrics_data['ram_usage']['percent']:5.1f}%\n", self.history.ram, "#EA4335", graph_width, timeline_str)
+        
         # TPU Mem
-        mem_bars = vertical_bar_chart(self.history.tpu_mem, width=graph_width, height=3)
-        mem_text = Text(f"HBM: {avg_mem_pct:5.1f}%\n", style="bold #FBBC05")
-        for line in mem_bars:
-            mem_text.append(line + "\n", style="#FBBC05")
-        mem_text.append(timeline_str, style="#FBBC05")
-        self.query_one("#tpu-mem-graph", Static).update(Panel(mem_text, title="AVG TPU Mem", box=box.ROUNDED, border_style="#FBBC05"))
+        self._update_graph("#tpu-mem-graph", "AVG TPU Mem", f"HBM ({total_hbm_gb:.1f} GB): {avg_mem_pct:5.1f}%\n", self.history.tpu_mem, "#FBBC05", graph_width, timeline_str)
 
         # Duty Cycle
         if self.console.height < 55:
@@ -210,12 +207,7 @@ class TpuTopApp(App):
             dc_graph_width = max(10, self.console.width - 6)
             dc_timeline_str = make_timeline(dc_graph_width)
             
-        dc_bars = vertical_bar_chart(self.history.tpu_duty_cycle, width=dc_graph_width, height=3)
-        dc_text = Text(f"DC: {avg_duty_cycle:5.1f}%\n", style="bold #E066FF")
-        for line in dc_bars:
-            dc_text.append(line + "\n", style="#E066FF")
-        dc_text.append(dc_timeline_str, style="#E066FF")
-        self.query_one("#duty-cycle-container", Static).update(Panel(dc_text, title="AVG TPU DUTY CYCLE", box=box.ROUNDED, border_style="#E066FF"))
+        self._update_graph("#duty-cycle-container", "AVG TPU DUTY CYCLE", f"DC ({num_devices} Chips): {avg_duty_cycle:5.1f}%\n", self.history.tpu_duty_cycle, "#E066FF", dc_graph_width, dc_timeline_str)
 
         # Update Processes Table
         current_pid = os.getpid()
