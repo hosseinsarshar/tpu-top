@@ -2,6 +2,7 @@ import os
 import time
 import asyncio
 from typing import Dict, Any
+import psutil
 
 from textual.app import App, ComposeResult
 from textual.widgets import Footer, Static
@@ -10,9 +11,16 @@ from textual import work
 from rich.panel import Panel
 from rich import box
 from rich.text import Text
+from rich.table import Table
 
 from tpu_top.state import MetricsHistory
 from tpu_top.metrics import MetricsCollector, HAS_TPU_INFO
+
+try:
+    from jax._src.pallas.mosaic.tpu_info import get_tpu_info_for_chip, ChipVersion
+    HAS_JAX_TPU_INFO = True
+except ImportError:
+    HAS_JAX_TPU_INFO = False
 from tpu_top.ui import (
     make_device_table, make_process_table, 
     vertical_bar_chart, make_timeline
@@ -22,7 +30,7 @@ class TpuTopApp(App):
     """A Textual app that preserves the original UI/UX using Rich components."""
 
     TITLE = "TPU-TOP"
-    BINDINGS = [("q", "quit", "Quit"), ("ctrl+c", "quit", "Quit")]
+    BINDINGS = [("q", "quit", "Quit"), ("ctrl+c", "quit", "Quit"), ("i", "toggle_info", "TPU Info"), ("escape", "default_view", "Default View")]
 
     CSS = """
     #header-container {
@@ -66,6 +74,7 @@ class TpuTopApp(App):
         self.use_mock = use_mock
         self.collector = MetricsCollector(use_mock=use_mock)
         self.history = MetricsHistory()
+        self.show_info = False
 
     def compose(self) -> ComposeResult:
         yield Static(id="header-container")
@@ -123,15 +132,125 @@ class TpuTopApp(App):
 
         self.collect_metrics_worker()
 
+    def action_toggle_info(self) -> None:
+        """Toggle the display of TPU info."""
+        self.show_info = not self.show_info
+
+    def action_default_view(self) -> None:
+        """Return to the default view (hide info)."""
+        self.show_info = False
+
+    def get_tpu_info_table(self) -> Table | None:
+        if not HAS_JAX_TPU_INFO:
+            return None
+        if not HAS_TPU_INFO:
+            return None
+            
+        try:
+            from tpu_info.device import get_local_chips, TpuChip
+            
+            chip_type, count = get_local_chips()
+            if chip_type is None:
+                return None
+                
+            mapping = {
+                TpuChip.V2: ChipVersion.TPU_V2,
+                TpuChip.V3: ChipVersion.TPU_V3,
+                TpuChip.V4: ChipVersion.TPU_V4,
+                TpuChip.V5E: ChipVersion.TPU_V5E,
+                TpuChip.V5P: ChipVersion.TPU_V5P,
+                TpuChip.V6E: ChipVersion.TPU_V6E,
+                TpuChip.V7X: ChipVersion.TPU_7X,
+            }
+            
+            jax_chip_version = mapping.get(chip_type)
+            if jax_chip_version is None:
+                 return None
+                 
+            num_cores = chip_type.value.devices_per_chip
+            
+            if (
+                jax_chip_version in {
+                    ChipVersion.TPU_V2,
+                    ChipVersion.TPU_V3,
+                    ChipVersion.TPU_7,
+                    ChipVersion.TPU_7X,
+                }
+                or jax_chip_version.is_lite
+            ):
+                num_cores = 1
+                
+            info = get_tpu_info_for_chip(jax_chip_version, num_cores)
+            
+            table = Table(box=box.ROUNDED, expand=True)
+            table.add_column("Parameter", style="cyan")
+            table.add_column("Value", style="green")
+            
+            def fmt_bytes(b):
+                if b == 0: return "0 B"
+                for unit in ['B', 'KiB', 'MiB', 'GiB', 'TiB']:
+                    if b < 1024: return f"{b:.2f} {unit}"
+                    b /= 1024
+                return f"{b:.2f} PiB"
+
+            def fmt_ops(o):
+                if o == 0: return "0"
+                for unit in ['', 'K', 'M', 'G', 'T', 'P']:
+                    if o < 1000: return f"{o:.2f} {unit}Ops"
+                    o /= 1000
+                return f"{o:.2f} EOps"
+                
+            table.add_row("Chip Version", str(info.chip_version))
+            table.add_row("Generation", str(info.generation))
+            table.add_row("Total Chips", str(count // chip_type.value.devices_per_chip))
+            table.add_row("Physical Cores per Chip", str(info.chip_version.num_physical_tensor_cores_per_chip))
+            table.add_row("Megacore Mode", "Yes" if info.is_megacore else "No")
+            table.add_row("Supports Megacore", "Yes" if info.chip_version.supports_megacore else "No")
+            table.add_row("Num Cores (Logical)", str(info.num_cores))
+            table.add_row("Num Lanes (per Core)", str(info.num_lanes))
+            table.add_row("Num Sublanes (per Core)", str(info.num_sublanes))
+            table.add_row("MXU Column Size (per Core)", str(info.mxu_column_size))
+            table.add_row("VMEM Capacity (per Core)", fmt_bytes(info.vmem_capacity_bytes))
+            table.add_row("CMEM Capacity (per Core)", fmt_bytes(info.cmem_capacity_bytes))
+            table.add_row("SMEM Capacity (per Core)", fmt_bytes(info.smem_capacity_bytes))
+            table.add_row("HBM Capacity (per Core)", fmt_bytes(info.hbm_capacity_bytes))
+            table.add_row("Memory Bandwidth (per Core)", f"{fmt_bytes(info.mem_bw_bytes_per_second)}/s")
+            table.add_row("BF16 Ops (per Core)", fmt_ops(info.bf16_ops_per_second))
+            table.add_row("INT8 Ops (per Core)", fmt_ops(info.int8_ops_per_second))
+            table.add_row("FP8 Ops (per Core)", fmt_ops(info.fp8_ops_per_second))
+            table.add_row("INT4 Ops (per Core)", fmt_ops(info.int4_ops_per_second))
+            
+            if info.sparse_core:
+                table.add_row("Sparse Core", f"Cores: {info.sparse_core.num_cores}, Subcores: {info.sparse_core.num_subcores}, Lanes: {info.sparse_core.num_lanes}, DMA Granule: {info.sparse_core.dma_granule_size_bytes} B")
+                
+            return table
+        except Exception as e:
+            table = Table(box=box.ROUNDED, expand=True)
+            table.add_column("Error", style="red")
+            table.add_row(f"Failed to get TPU info: {e}")
+            return table
+
     @work(thread=True)
-    async def collect_metrics_worker(self) -> None:
-        while True:
+    def collect_metrics_worker(self) -> None:
+        while self.is_running:
             try:
                 metrics_data = self.collector.collect_metrics()
                 self.call_from_thread(self.update_ui, metrics_data)
             except Exception as e:
                 pass
-            await asyncio.sleep(0.5)
+            time.sleep(0.5)
+
+    def _update_graph(self, widget_id: str, panel_title: str, header_str: str, history_data: list, color: str, width: int, timeline: str):
+        """Helper to update a graph panel to avoid repeated logic."""
+        bars = vertical_bar_chart(history_data, width=width, height=3)
+        text = Text(header_str, style=f"bold {color}")
+        for line in bars:
+            text.append(line + "\n", style=color)
+        text.append(timeline, style=color)
+        
+        self.query_one(widget_id, Static).update(
+            Panel(text, title=panel_title, box=box.ROUNDED, border_style=color)
+        )
 
     def update_ui(self, metrics_data: Dict[str, Any]) -> None:
         # Update history
@@ -139,9 +258,12 @@ class TpuTopApp(App):
         self.history.append_ram(metrics_data["ram_usage"]["percent"])
         
         devices = metrics_data["devices"]
+        num_devices = len(devices)
         avg_util = sum(d["tensorcore_util"] for d in devices) / len(devices) if devices else 0
         avg_duty_cycle = sum(d["duty_cycle"] for d in devices) / len(devices) if devices else 0
         avg_mem_pct = sum(d["memory_usage"] / d["total_memory"] * 100 for d in devices) / len(devices) if devices else 0
+        total_hbm_gb = sum(d["total_memory"] for d in devices) / (1024**3) if devices else 0.0
+        total_ram_gb = metrics_data['ram_usage']['total'] / (1024**3)
         
         self.history.append_tpu_util(avg_util)
         self.history.append_tpu_mem(avg_mem_pct)
@@ -171,36 +293,17 @@ class TpuTopApp(App):
         timeline_str = make_timeline(graph_width)
 
         # CPU
-        cpu_bars = vertical_bar_chart(self.history.cpu, width=graph_width, height=3)
-        cpu_text = Text(f"CPU: {metrics_data['cpu_usage']:5.1f}%\n", style="bold #4285F4")
-        for line in cpu_bars:
-            cpu_text.append(line + "\n", style="#4285F4")
-        cpu_text.append(timeline_str, style="#4285F4")
-        self.query_one("#cpu-graph", Static).update(Panel(cpu_text, title="CPU Activity", box=box.ROUNDED, border_style="#4285F4"))
-
+        cpu_count = psutil.cpu_count() or 1
+        self._update_graph("#cpu-graph", "AVG CPU Activity", f"CPU ({cpu_count} cores): {metrics_data['cpu_usage']:5.1f}%\n", self.history.cpu, "#4285F4", graph_width, timeline_str)
+        
         # TPU Util
-        util_bars = vertical_bar_chart(self.history.tpu_util, width=graph_width, height=3)
-        util_text = Text(f"UTL: {avg_util:5.1f}%\n", style="bold #34A853")
-        for line in util_bars:
-            util_text.append(line + "\n", style="#34A853")
-        util_text.append(timeline_str, style="#34A853")
-        self.query_one("#tpu-util-graph", Static).update(Panel(util_text, title="AVG TPU (TC) UTL", box=box.ROUNDED, border_style="#34A853"))
-
+        self._update_graph("#tpu-util-graph", "AVG TPU (TC) UTL", f"UTL ({num_devices} Chips): {avg_util:5.1f}%\n", self.history.tpu_util, "#34A853", graph_width, timeline_str)
+        
         # RAM
-        ram_bars = vertical_bar_chart(self.history.ram, width=graph_width, height=3)
-        ram_text = Text(f"RAM: {metrics_data['ram_usage']['percent']:5.1f}%\n", style="bold #EA4335")
-        for line in ram_bars:
-            ram_text.append(line + "\n", style="#EA4335")
-        ram_text.append(timeline_str, style="#EA4335")
-        self.query_one("#ram-graph", Static).update(Panel(ram_text, title="RAM Activity", box=box.ROUNDED, border_style="#EA4335"))
-
+        self._update_graph("#ram-graph", "RAM Usage", f"RAM ({total_ram_gb:.1f} GB): {metrics_data['ram_usage']['percent']:5.1f}%\n", self.history.ram, "#EA4335", graph_width, timeline_str)
+        
         # TPU Mem
-        mem_bars = vertical_bar_chart(self.history.tpu_mem, width=graph_width, height=3)
-        mem_text = Text(f"HBM: {avg_mem_pct:5.1f}%\n", style="bold #FBBC05")
-        for line in mem_bars:
-            mem_text.append(line + "\n", style="#FBBC05")
-        mem_text.append(timeline_str, style="#FBBC05")
-        self.query_one("#tpu-mem-graph", Static).update(Panel(mem_text, title="AVG TPU Mem", box=box.ROUNDED, border_style="#FBBC05"))
+        self._update_graph("#tpu-mem-graph", "AVG TPU Mem", f"HBM ({total_hbm_gb:.1f} GB): {avg_mem_pct:5.1f}%\n", self.history.tpu_mem, "#FBBC05", graph_width, timeline_str)
 
         # Duty Cycle
         if self.console.height < 55:
@@ -210,12 +313,7 @@ class TpuTopApp(App):
             dc_graph_width = max(10, self.console.width - 6)
             dc_timeline_str = make_timeline(dc_graph_width)
             
-        dc_bars = vertical_bar_chart(self.history.tpu_duty_cycle, width=dc_graph_width, height=3)
-        dc_text = Text(f"DC: {avg_duty_cycle:5.1f}%\n", style="bold #E066FF")
-        for line in dc_bars:
-            dc_text.append(line + "\n", style="#E066FF")
-        dc_text.append(dc_timeline_str, style="#E066FF")
-        self.query_one("#duty-cycle-container", Static).update(Panel(dc_text, title="AVG TPU DUTY CYCLE", box=box.ROUNDED, border_style="#E066FF"))
+        self._update_graph("#duty-cycle-container", "AVG TPU DUTY CYCLE", f"DC ({num_devices} Chips): {avg_duty_cycle:5.1f}%\n", self.history.tpu_duty_cycle, "#E066FF", dc_graph_width, dc_timeline_str)
 
         # Update Processes Table
         current_pid = os.getpid()
@@ -230,8 +328,15 @@ class TpuTopApp(App):
         
         processes = tpu_procs + cpu_procs
 
-        proc_table = make_process_table(processes)
-        self.query_one("#processes-container", Static).update(Panel(proc_table, title="Processes", box=box.ROUNDED))
+        if self.show_info:
+            info_table = self.get_tpu_info_table()
+            if info_table:
+                self.query_one("#processes-container", Static).update(Panel(info_table, title="TPU Info", box=box.ROUNDED))
+            else:
+                self.query_one("#processes-container", Static).update(Panel(Text("TPU Info not available", style="red"), title="TPU Info", box=box.ROUNDED))
+        else:
+            proc_table = make_process_table(processes)
+            self.query_one("#processes-container", Static).update(Panel(proc_table, title="Processes", box=box.ROUNDED))
 
 def main():
     use_mock = not HAS_TPU_INFO or os.environ.get("TPU_TOP_MOCK") == "1"
