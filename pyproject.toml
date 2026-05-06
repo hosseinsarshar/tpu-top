@@ -21,6 +21,7 @@ dependencies = [
     "psutil",
     "tpu-info",
     "jax[tpu]",
+    "textual",
 ]
 
 [project.urls]
