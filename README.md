@@ -23,6 +23,7 @@ A simple terminal-based monitoring dashboard for Google Cloud TPUs, designed to 
 *   **Duty Cycle History**: A dedicated panel showing the history of TPU duty cycle.
 *   **PIDs per TPU**: A dedicated process list showing which PIDs are utilizing specific TPU devices, including their host RAM and CPU impact.
 *   **Active HLO Ops**: Current HLO operations executing on each TPU core (Tensor Cores and Sparse Cores).
+*   **TPU Hardware Info**: Detailed hardware specifications (like VMEM, HBM, memory bandwidth, peak Ops, sparse core details) accessible by pressing `i`.
 
 ## Calculations Explained
 
@@ -88,6 +89,11 @@ Once installed, you can launch the dashboard from anywhere in your terminal:
 ```bash
 tpu-top
 ```
+
+### Keyboard Shortcuts
+*   `i`: Toggle TPU hardware information table.
+*   `escape`: Return to the default processes view.
+*   `q` or `Ctrl+C`: Quit the application.
 
 ## Running Tests
 
