@@ -196,9 +196,9 @@ class TpuTopApp(App):
             def fmt_ops(o):
                 if o == 0: return "0"
                 for unit in ['', 'K', 'M', 'G', 'T', 'P']:
-                    if o < 1000: return f"{o:.2f} {unit}Ops"
+                    if o < 1000: return f"{o:.2f} {unit}Op/s"
                     o /= 1000
-                return f"{o:.2f} EOps"
+                return f"{o:.2f} EOp/s"
                 
             table.add_row("Chip Version", str(info.chip_version))
             table.add_row("Generation", str(info.generation))
