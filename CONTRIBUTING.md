@@ -19,30 +19,36 @@ Thank you for your interest in contributing to `tpu-top`! This document provides
 ## Code Structure
 
 The project follows a standard PyPI layout:
-*   `src/tpu_top/tputop.py`: This is the core of the application. It contains the TUI layout definition (using `rich`), the metrics gathering loop, and the rendering logic.
+*   `src/tpu_top/tputop.py`: The Textual app. It lays out the screen, runs the metrics loop in a background thread, and handles key bindings and the command-line flags.
+*   `src/tpu_top/widgets.py`: Textual widgets: the header bar, history graphs, the process table and the help / hardware info dialogs.
+*   `src/tpu_top/ui.py`: Rich renderables and helpers: gauges, braille graphs, the time axis and the devices table.
+*   `src/tpu_top/theme.py`: The color palette. Metric colors stay fixed; neutral colors follow the active Textual theme.
+*   `src/tpu_top/metrics.py`: Collects host, TPU and process metrics (and the mock data).
+*   `src/tpu_top/state.py`: Keeps the metric history used by the graphs.
+*   `src/tpu_top/hardware.py`: Reads the TPU hardware specs shown with `i`.
 *   `tests/`: Contains unit tests.
 
 ## Extending the Dashboard
 
 ### Adding New Metrics
 If you want to add new metrics (e.g., HLO queue size or transfer latencies as discussed):
-1.  Locate the metrics gathering section in the `main()` function of `tputop.py`.
-2.  Use `tpu_info` (or fallbacks to `libtpu`) to fetch the new data.
-3.  Add a new panel in `make_layout()` or add columns to `make_device_table()`.
-4.  Pass the new data to the rendering functions.
+1.  Collect the value in `MetricsCollector.collect_metrics()` in `metrics.py`, using `tpu_info` (or fallbacks to `libtpu`).
+2.  If it needs a history graph, add a series to `MetricsHistory` in `state.py` and append to it in `TpuTopApp.update_ui()`.
+3.  Show it: add a column to `make_device_table()` in `ui.py`, or a new `MetricGraph` in `TpuTopApp.compose()`.
+4.  Pick its color in `theme.py` so it looks the same everywhere it shows up.
 
 ### Mock Mode
 For development on machines without access to physical TPUs, you can run in mock mode:
 ```bash
-TPU_TOP_MOCK=1 tpu-top
+tpu-top --mock        # or: TPU_TOP_MOCK=1 tpu-top
 ```
-You can extend the mock data generators (`get_mock_metrics`) in `tputop.py` to simulate the new metrics you are adding.
+You can extend the mock data generator (`_MockTPU`) in `metrics.py` to simulate the new metrics you are adding.
 
 ## Running Tests
 
 To validate changes, run the unit tests:
 ```bash
-python -m unittest tests/test_main.py
+python -m unittest discover tests
 ```
 
 ## Building and Publishing

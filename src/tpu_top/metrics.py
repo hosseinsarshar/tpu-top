@@ -1,7 +1,7 @@
 import os
 import time
 import random
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import psutil
 import logging
 
@@ -19,12 +19,160 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Python flags that take a value as the next argument.
+_PYTHON_FLAGS_WITH_VALUE = {"-W", "-X", "--check-hash-based-pycs"}
+
+
+def python_target(cmdline: List[str]) -> Optional[str]:
+    """Return the script or module a python command line runs, if any."""
+    args = cmdline[1:]
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "-m" and i + 1 < len(args):
+            return args[i + 1]
+        if arg == "-c":
+            return None
+        if arg in _PYTHON_FLAGS_WITH_VALUE:
+            i += 2
+            continue
+        if arg.startswith("-"):
+            i += 1
+            continue
+        return os.path.basename(arg)
+    return None
+
+
+class _MockTPU:
+    """Smooth, plausible fake metrics, used when no TPU is available."""
+
+    NUM_CHIPS = 4
+    CORES_PER_CHIP = 2
+    HBM_PER_CHIP = 95 * 1024**3
+    COMPUTATION = "main.204_spmd"
+    OPS = (
+        "fusion.1824",
+        "convolution.311",
+        "dot_general.92",
+        "custom-call.18",
+        "all-reduce.47",
+        "reduce-scatter.12",
+        "all-gather.33",
+        "copy-start.6",
+    )
+
+    def __init__(self, seed: Optional[int] = None):
+        self.rng = random.Random(seed)
+        self.tick = 0
+        self.duty = [93.0] * self.NUM_CHIPS
+        self.mxu = [0.55] * self.NUM_CHIPS
+        self.hbm = [0.86 + 0.01 * i for i in range(self.NUM_CHIPS)]
+        self.cpu = 18.0
+        self.ram = 41.0
+        self.stall = 0
+        self.user = "root"
+
+    def _walk(self, value: float, target: float, speed: float, noise: float, low: float, high: float) -> float:
+        value += speed * (target - value) + self.rng.gauss(0.0, noise)
+        return min(max(value, low), high)
+
+    def step(self) -> None:
+        self.tick += 1
+        # Every so often the input pipeline stalls and the TPUs go quiet.
+        if self.stall == 0 and self.rng.random() < 0.02:
+            self.stall = self.rng.randint(4, 10)
+        stalled = self.stall > 0
+        if stalled:
+            self.stall -= 1
+        for i in range(self.NUM_CHIPS):
+            self.duty[i] = self._walk(self.duty[i], 25.0 if stalled else 94.0, 0.35, 2.5, 0.0, 100.0)
+            self.mxu[i] = self._walk(self.mxu[i], 0.58, 0.15, 0.04, 0.2, 0.9)
+            self.hbm[i] = self._walk(self.hbm[i], 0.86 + 0.01 * i, 0.05, 0.002, 0.5, 0.99)
+        self.cpu = self._walk(self.cpu, 45.0 if stalled else 16.0, 0.3, 2.0, 1.0, 100.0)
+        self.ram = self._walk(self.ram, 41.0, 0.1, 0.15, 5.0, 95.0)
+
+    def devices(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "id": i,
+                "memory_usage": int(self.hbm[i] * self.HBM_PER_CHIP),
+                "total_memory": self.HBM_PER_CHIP,
+                "duty_cycle": self.duty[i],
+                "temperature": 0,
+                "tensorcore_util": self.duty[i] * self.mxu[i],
+            }
+            for i in range(self.NUM_CHIPS)
+        ]
+
+    def hlo_map(self) -> Dict[int, Dict[str, str]]:
+        hlo_map: Dict[int, Dict[str, str]] = {}
+        for chip in range(self.NUM_CHIPS):
+            cores = {}
+            for core in range(self.CORES_PER_CHIP):
+                if self.duty[chip] < 30:
+                    cores[f"TC{core}"] = "N/A"
+                    continue
+                op = self.OPS[(self.tick // 3 + core * 3 + chip // 2) % len(self.OPS)]
+                cores[f"TC{core}"] = f"HLO: {op}; HLO computation: {self.COMPUTATION}"
+            hlo_map[chip] = cores
+        return hlo_map
+
+    def processes(self) -> List[Dict[str, Any]]:
+        train_cpu = 140.0 + self.rng.uniform(-20.0, 20.0)
+        procs = [
+            {
+                "pid": 4242,
+                "name": "train.py",
+                "user": self.user,
+                "command": "python3 train.py --model=llama-3-8b --global-batch-size=256",
+                "device": f"TPU {chip}",
+                "cpu": train_cpu,
+                "memory": 26 * 1024**3 + 712 * 1024**2,
+            }
+            for chip in range(self.NUM_CHIPS)
+        ]
+        procs += [
+            {
+                "pid": 4317,
+                "name": "input_pipeline",
+                "user": self.user,
+                "command": "python3 -m input_pipeline --workers=16 --prefetch=8",
+                "device": "CPU",
+                "cpu": max(0.0, 240.0 + self.rng.uniform(-40.0, 40.0)),
+                "memory": 6 * 1024**3 + 205 * 1024**2,
+            },
+            {
+                "pid": 4388,
+                "name": "tensorboard.main",
+                "user": self.user,
+                "command": "python3 -m tensorboard.main --logdir=/tmp/logs --port=6006",
+                "device": "CPU",
+                "cpu": max(0.0, 6.0 + self.rng.uniform(-3.0, 3.0)),
+                "memory": 1100 * 1024**2,
+            },
+            {
+                "pid": 1206,
+                "name": "gcsfuse",
+                "user": self.user,
+                "command": "gcsfuse --implicit-dirs my-training-data /gcs/data",
+                "device": "CPU",
+                "cpu": max(0.0, 12.0 + self.rng.uniform(-4.0, 4.0)),
+                "memory": 310 * 1024**2,
+            },
+        ]
+        return procs
+
+    def ram_usage(self) -> Dict[str, float]:
+        total = 1000 * 1024**3
+        return {"percent": self.ram, "total": total, "used": total * self.ram / 100}
+
 
 class MetricsCollector:
     def __init__(self, use_mock: bool = False):
         self.use_mock = use_mock
         self._prev_cpu_times = None
         self.process_cache = {}
+        self._mock = _MockTPU() if use_mock else None
 
     def get_cpu_usage(self) -> float:
         """Read CPU usage using psutil."""
@@ -53,10 +201,9 @@ class MetricsCollector:
             proc = psutil.Process(pid)
             name = proc.name()
             if "python" in name.lower():
-                cmdline = proc.cmdline()
-                if len(cmdline) > 1:
-                    import os
-                    return os.path.basename(cmdline[1])
+                target = python_target(proc.cmdline())
+                if target:
+                    return target
             return name
         except Exception as e:
             logger.debug(f"Failed to get process name for PID {pid} via psutil: {e}")
@@ -67,41 +214,32 @@ class MetricsCollector:
                 logger.debug(f"Failed to get process name for PID {pid} via /proc: {e2}")
                 return "unknown"
 
+    def get_process_details(self, pid: int) -> Dict[str, str]:
+        """Get the owner and full command line of a process."""
+        details = {"user": "", "command": ""}
+        try:
+            entry = self.process_cache.get(pid)
+            proc = entry["proc"] if entry else psutil.Process(pid)
+            details["command"] = " ".join(proc.cmdline()).strip()
+            try:
+                details["user"] = proc.username()
+            except (KeyError, psutil.Error):
+                details["user"] = str(proc.uids().real)
+        except (psutil.Error, OSError) as e:
+            logger.debug(f"Failed to get details for PID {pid}: {e}")
+        return details
+
     def get_mock_metrics(self) -> List[Dict[str, Any]]:
         """Generate mock metrics for demonstration."""
-        devices = []
-        for i in range(4):
-            devices.append({
-                "id": i,
-                "memory_usage": random.randint(10, 32) * 1024 * 1024 * 1024,
-                "total_memory": 32 * 1024 * 1024 * 1024,
-                "duty_cycle": random.random() * 100,
-                "temperature": random.randint(30, 70),
-                "tensorcore_util": random.random() * 100
-            })
-        return devices
+        if self._mock is None:
+            self._mock = _MockTPU()
+        return self._mock.devices()
 
     def get_mock_processes(self) -> List[Dict[str, Any]]:
         """Generate mock processes."""
-        procs = []
-        names = ["train.py", "eval.py", "data_loader", "python"]
-        for i in range(3):
-            procs.append({
-                "pid": random.randint(1000, 9999),
-                "name": random.choice(names),
-                "device": f"TPU {random.randint(0, 3)}",
-                "cpu": random.random() * 100,
-                "memory": random.randint(1, 8) * 1024 * 1024 * 1024
-            })
-        # Add a CPU process
-        procs.append({
-            "pid": random.randint(1000, 9999),
-            "name": "top",
-            "device": "CPU",
-            "cpu": 15.0,
-            "memory": 100 * 1024 * 1024
-        })
-        return procs
+        if self._mock is None:
+            self._mock = _MockTPU()
+        return self._mock.processes()
 
     def collect_metrics(self) -> Dict[str, Any]:
         """Collect all metrics."""
@@ -110,11 +248,15 @@ class MetricsCollector:
         processes = []
         
         if self.use_mock:
+            if self._mock is None:
+                self._mock = _MockTPU()
+            self._mock.step()
             devices = self.get_mock_metrics()
             processes = self.get_mock_processes()
-            cpu_usage = random.uniform(40.0, 80.0)
-            ram_usage = {"percent": random.uniform(60.0, 90.0), "total": 1000 * 1024**3, "used": 700 * 1024**3}
-            devices_per_chip = 1
+            hlo_map = self._mock.hlo_map()
+            cpu_usage = self._mock.cpu
+            ram_usage = self._mock.ram_usage()
+            devices_per_chip = self._mock.CORES_PER_CHIP
             num_chips = len(devices)
         else:
             cpu_usage = self.get_cpu_usage()
@@ -229,7 +371,8 @@ class MetricsCollector:
                 self.process_cache[pid] = {
                     'proc': proc,
                     'prev_time': time.time(),
-                    'prev_cpu': sum(proc.cpu_times()[:2])
+                    'prev_cpu': sum(proc.cpu_times()[:2]),
+                    'last_pct': 0.0
                 }
                 cpu_pct = 0.0
             else:
@@ -244,8 +387,11 @@ class MetricsCollector:
                     cpu_pct = (cpu_diff / time_diff) * 100
                     cache_entry['prev_time'] = curr_time
                     cache_entry['prev_cpu'] = curr_cpu
+                    cache_entry['last_pct'] = cpu_pct
                 else:
-                    cpu_pct = 0.0
+                    # Asked again within the same sample (e.g. one PID that
+                    # owns several chips): reuse the last reading.
+                    cpu_pct = cache_entry.get('last_pct', 0.0)
                     
             mem_info = self.process_cache[pid]['proc'].memory_info()
             mem_rss = mem_info.rss if mem_info else 0
@@ -260,14 +406,18 @@ class MetricsCollector:
         path_to_chip_idx = {path: idx for idx, path in enumerate(sorted_paths)}
         
         tpu_pids = set(owners.values())
+        seen_pids = set(tpu_pids)
+        details_cache: Dict[int, Dict[str, Any]] = {}
         
         for dev_path, pid in owners.items():
             chip_idx = path_to_chip_idx.get(dev_path, -1)
             cpu_pct, mem_rss = self._get_process_cpu_mem(pid)
+            if pid not in details_cache:
+                details_cache[pid] = {"name": self.get_process_name(pid), **self.get_process_details(pid)}
                 
             processes.append({
                 "pid": pid,
-                "name": self.get_process_name(pid),
+                **details_cache[pid],
                 "device": f"TPU {chip_idx}",
                 "cpu": cpu_pct,
                 "memory": mem_rss
@@ -277,6 +427,7 @@ class MetricsCollector:
             for proc in psutil.process_iter(['pid', 'name', 'memory_info']):
                 try:
                     pid = proc.info['pid']
+                    seen_pids.add(pid)
                     if pid in tpu_pids:
                         continue
                         
@@ -286,6 +437,7 @@ class MetricsCollector:
                         processes.append({
                             "pid": pid,
                             "name": self.get_process_name(pid),
+                            **self.get_process_details(pid),
                             "device": "CPU",
                             "cpu": cpu_pct,
                             "memory": mem_rss
@@ -295,5 +447,10 @@ class MetricsCollector:
                     continue
         except Exception as e:
             logger.error(f"Error iterating processes: {e}")
+        else:
+            # Forget processes that have exited so the cache doesn't grow forever.
+            for pid in list(self.process_cache):
+                if pid not in seen_pids:
+                    del self.process_cache[pid]
             
         return processes

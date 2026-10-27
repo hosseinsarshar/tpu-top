@@ -1,347 +1,611 @@
+import argparse
 import os
+import socket
+import threading
 import time
-import asyncio
-from typing import Dict, Any
+from typing import Any, Dict, List, Optional, Tuple
+
 import psutil
-
-from textual.app import App, ComposeResult
-from textual.widgets import Footer, Static
-from textual.containers import Grid
-from textual import work
-from rich.panel import Panel
-from rich import box
+from rich.console import Group
 from rich.text import Text
-from rich.table import Table
+from textual import events, work
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Container, Horizontal, Vertical
+from textual.geometry import Size
+from textual.message import Message
+from textual.widgets import Footer, Static
+from textual.worker import get_current_worker
 
-from tpu_top.state import MetricsHistory
+from tpu_top.hardware import HardwareInfoUnavailable, collect_hardware_info
 from tpu_top.metrics import MetricsCollector, HAS_TPU_INFO
-
-try:
-    from jax._src.pallas.mosaic.tpu_info import get_tpu_info_for_chip, ChipVersion
-    HAS_JAX_TPU_INFO = True
-except ImportError:
-    HAS_JAX_TPU_INFO = False
-from tpu_top.ui import (
-    make_device_table, make_process_table, 
-    vertical_bar_chart, make_timeline
+from tpu_top.state import MetricsHistory
+from tpu_top.theme import THEME_NAME, TPU_TOP_THEME, Palette, build_palette
+from tpu_top.ui import GIB, build_process_rows, make_device_table, make_info_sheet
+from tpu_top.widgets import (
+    HeaderBar,
+    HelpScreen,
+    InfoScreen,
+    MetricGraph,
+    ProcessTable,
+    make_help,
 )
 
-class TpuTopApp(App):
-    """A Textual app that preserves the original UI/UX using Rich components."""
+# Rows the process list should keep before the graphs are stacked on two rows.
+PROCESSES_MIN_ROWS = 12
 
-    TITLE = "TPU-TOP"
-    BINDINGS = [("q", "quit", "Quit"), ("ctrl+c", "quit", "Quit"), ("i", "toggle_info", "TPU Info"), ("escape", "default_view", "Default View")]
+
+def _package_version(name: str) -> str:
+    try:
+        import importlib.metadata
+
+        return importlib.metadata.version(name)
+    except Exception:
+        return "--"
+
+
+class MetricsReady(Message):
+    """A new metrics sample, posted by the collector thread."""
+
+    def __init__(self, data: Dict[str, Any]) -> None:
+        super().__init__()
+        self.data = data
+
+
+class MetricsFailed(Message):
+    """Collecting metrics failed, posted by the collector thread."""
+
+    def __init__(self, error: str) -> None:
+        super().__init__()
+        self.error = error
+
+
+class HardwareInfoReady(Message):
+    """Hardware specs (or the reason they are unavailable)."""
+
+    def __init__(self, sections: Optional[list], error: str = "") -> None:
+        super().__init__()
+        self.sections = sections
+        self.error = error
+
+
+class TpuTopApp(App):
+    """A live dashboard for the TPUs and host of a Cloud TPU VM or GKE pod."""
+
+    TITLE = "tpu-top"
+    BINDINGS = [
+        Binding("q", "quit", "Quit"),
+        Binding("ctrl+c", "quit", "Quit", show=False, priority=True),
+        Binding("i", "toggle_info", "TPU info"),
+        Binding("p", "toggle_pause", "Pause"),
+        Binding("space", "toggle_pause", "Pause", show=False),
+        Binding("s", "cycle_sort", "Sort"),
+        Binding("g", "toggle_graph_style", "Graph style"),
+        Binding("question_mark", "help", "Help"),
+        Binding("escape", "default_view", "Default view", show=False),
+    ]
 
     CSS = """
-    #header-container {
-        height: 4;
-        border: none;
-    }
-    #devices-container {
+    #devices {
         height: auto;
-        border: none;
+        border: round $panel-lighten-2;
+        border-title-align: left;
+        border-subtitle-align: right;
+        padding: 0 1;
     }
-    #graphs-container {
-        layout: grid;
-        grid-size: 2;
+    #graphs {
         height: auto;
-        border: none;
     }
-    #graphs-container.row-layout {
-        grid-size: 5;
+    #graphs Horizontal {
         height: 7;
     }
-    #duty-cycle-container {
-        column-span: 2;
+    #graphs MetricGraph {
+        width: 1fr;
+    }
+    #graphs.row {
+        layout: horizontal;
         height: 7;
-        border: none;
     }
-    #graphs-container.row-layout #duty-cycle-container {
-        column-span: 1;
+    #graphs.row.short, #graphs.row.short Horizontal {
+        height: 6;
     }
-    #processes-container {
+    #graphs.row #tpu-graphs {
+        width: 3fr;
+    }
+    #graphs.row #host-graphs {
+        width: 2fr;
+    }
+    #processes {
         height: 1fr;
-        border: none;
+        min-height: 6;
+        border: round $panel-lighten-2;
+        border-title-align: left;
+        border-subtitle-align: right;
     }
-    Static {
-        padding: 0;
-        margin: 0;
+    ProcessTable:focus {
+        background-tint: $foreground 0%;
+    }
+    ProcessTable > .datatable--header,
+    ProcessTable:focus > .datatable--header {
+        background: $background;
+        background-tint: $foreground 0%;
+        color: $text-muted;
+        text-style: bold;
+    }
+    ProcessTable > .datatable--even-row {
+        background: $foreground 3%;
+    }
+    ProcessTable > .datatable--cursor {
+        background: $primary 10%;
+        color: $foreground;
+        text-style: none;
+    }
+    ProcessTable:focus > .datatable--cursor {
+        background: $primary 22%;
+        color: $foreground;
+        text-style: none;
+    }
+    ProcessTable > .datatable--hover {
+        background: $primary 8%;
     }
     """
 
-    def __init__(self, use_mock: bool = False):
+    def __init__(self, use_mock: bool = False, interval: float = 0.5, mock_requested: bool = True):
         super().__init__()
         self.use_mock = use_mock
+        self.mock_requested = mock_requested
+        self.interval = interval
         self.collector = MetricsCollector(use_mock=use_mock)
         self.history = MetricsHistory()
-        self.show_info = False
+        self.palette: Palette = build_palette()
+        self.paused = False
+        self.graph_style = "braille"
+        self.compact = False
+        self.last_data: Optional[Dict[str, Any]] = None
+        self.last_error = ""
+        self._hardware_info: Optional[HardwareInfoReady] = None
+        self._stop = threading.Event()
+        self._setup_done = False
+        self._terminal_size: Optional[Size] = None
+
+    # ------------------------------------------------------------------ setup
 
     def compose(self) -> ComposeResult:
-        yield Static(id="header-container")
-        yield Static(id="devices-container")
-        
-        with Grid(id="graphs-container"):
-            yield Static(id="cpu-graph")
-            yield Static(id="tpu-util-graph")
-            yield Static(id="ram-graph")
-            yield Static(id="tpu-mem-graph")
-            yield Static(id="duty-cycle-container")
-            
-        yield Static(id="processes-container")
+        yield HeaderBar(id="header")
+        yield Static(id="devices")
+        with Container(id="graphs"):
+            with Horizontal(id="tpu-graphs"):
+                yield MetricGraph("TensorCore util", "tensorcore", short_label="TC util", id="tc-graph")
+                yield MetricGraph("Duty cycle", "duty_cycle", short_label="Duty", id="dc-graph")
+                yield MetricGraph("HBM", "hbm", id="hbm-graph")
+            with Horizontal(id="host-graphs"):
+                yield MetricGraph("CPU", "cpu", id="cpu-graph")
+                yield MetricGraph("RAM", "ram", id="ram-graph")
+        with Vertical(id="processes"):
+            yield ProcessTable(id="process-table")
         yield Footer()
 
     def on_mount(self) -> None:
+        # Keep references to the main screen's widgets: on some Textual versions
+        # `App.query_one` searches the active screen, which may be a dialog.
+        self.header_bar = self.query_one(HeaderBar)
+        self.devices_panel = self.query_one("#devices", Static)
+        self.graphs_box = self.query_one("#graphs", Container)
+        self.graph_views = {graph.id: graph for graph in self.query(MetricGraph)}
+        self.processes_panel = self.query_one("#processes", Vertical)
+        self.process_table = self.query_one(ProcessTable)
+
+        self.register_theme(TPU_TOP_THEME)
+        self.theme = THEME_NAME
+        self.theme_changed_signal.subscribe(self, lambda _theme: self._apply_palette())
+
         # Set up versions for header
         try:
             import libtpu
-            self.libtpu_version = libtpu.__version__
+
+            self.libtpu_version = getattr(libtpu, "__version__", None) or _package_version("libtpu")
         except ImportError:
             self.libtpu_version = "--"
-            
+
         try:
             import tpu_info
-            self.tpu_info_version = getattr(tpu_info, "__version__", None)
-            if not self.tpu_info_version:
-                import importlib.metadata
-                try:
-                    self.tpu_info_version = importlib.metadata.version("tpu-info")
-                except importlib.metadata.PackageNotFoundError:
-                    self.tpu_info_version = "--"
+
+            self.tpu_info_version = getattr(tpu_info, "__version__", None) or _package_version("tpu-info")
         except ImportError:
             self.tpu_info_version = "--"
-            
-        try:
-            import importlib.metadata
-            self.tpu_top_version = importlib.metadata.version("tpu-top")
-        except (importlib.metadata.PackageNotFoundError, ImportError):
-            self.tpu_top_version = "--"
+
+        self.tpu_top_version = _package_version("tpu-top")
 
         self.tpu_topology = os.environ.get("TPU_ACCELERATOR_TYPE")
         if self.tpu_topology:
-            self.tpu_topology = self.tpu_topology.upper()
+            self.tpu_topology = f"TPU {self.tpu_topology}"
         if not self.tpu_topology:
             if self.use_mock:
-                self.tpu_topology = "TPU Mock"
+                self.tpu_topology = "TPU mock"
             else:
                 try:
                     from tpu_info import device
+
                     chip_type, _ = device.get_local_chips()
                     self.tpu_topology = f"TPU {chip_type.value.name}"
                 except Exception:
-                    self.tpu_topology = "TPU Unknown"
+                    self.tpu_topology = "TPU unknown"
 
+        self.host_name = socket.gethostname()
+        worker_id = os.environ.get("TPU_WORKER_ID")
+        if worker_id:
+            self.host_name = f"{self.host_name} · worker {worker_id}"
+
+        self._setup_done = True
+        self._apply_palette()
+        self._update_layout()
+        self._render_all()
+        if self.use_mock and not self.mock_requested:
+            self.notify(
+                "tpu-info is not installed, so tpu-top is showing mock data.",
+                title="Mock data",
+                severity="warning",
+                timeout=8,
+            )
         self.collect_metrics_worker()
 
-    def action_toggle_info(self) -> None:
-        """Toggle the display of TPU info."""
-        self.show_info = not self.show_info
-
-    def action_default_view(self) -> None:
-        """Return to the default view (hide info)."""
-        self.show_info = False
-
-    def get_tpu_info_table(self) -> Table | None:
-        if not HAS_JAX_TPU_INFO:
-            return None
-        if not HAS_TPU_INFO:
-            return None
-            
-        try:
-            from tpu_info.device import get_local_chips, TpuChip
-            
-            chip_type, count = get_local_chips()
-            if chip_type is None:
-                return None
-                
-            mapping = {
-                TpuChip.V2: ChipVersion.TPU_V2,
-                TpuChip.V3: ChipVersion.TPU_V3,
-                TpuChip.V4: ChipVersion.TPU_V4,
-                TpuChip.V5E: ChipVersion.TPU_V5E,
-                TpuChip.V5P: ChipVersion.TPU_V5P,
-                TpuChip.V6E: ChipVersion.TPU_V6E,
-                TpuChip.V7X: ChipVersion.TPU_7X,
-            }
-            
-            jax_chip_version = mapping.get(chip_type)
-            if jax_chip_version is None:
-                 return None
-                 
-            num_cores = chip_type.value.devices_per_chip
-            
-            if (
-                jax_chip_version in {
-                    ChipVersion.TPU_V2,
-                    ChipVersion.TPU_V3,
-                    ChipVersion.TPU_7,
-                    ChipVersion.TPU_7X,
-                }
-                or jax_chip_version.is_lite
-            ):
-                num_cores = 1
-                
-            info = get_tpu_info_for_chip(jax_chip_version, num_cores)
-            
-            table = Table(box=box.ROUNDED, expand=True)
-            table.add_column("Parameter", style="cyan")
-            table.add_column("Value", style="green")
-            
-            def fmt_bytes(b):
-                if b == 0: return "0 B"
-                for unit in ['B', 'KiB', 'MiB', 'GiB', 'TiB']:
-                    if b < 1024: return f"{b:.2f} {unit}"
-                    b /= 1024
-                return f"{b:.2f} PiB"
-
-            def fmt_ops(o):
-                if o == 0: return "0"
-                for unit in ['', 'K', 'M', 'G', 'T', 'P']:
-                    if o < 1000: return f"{o:.2f} {unit}Op/s"
-                    o /= 1000
-                return f"{o:.2f} EOp/s"
-                
-            table.add_row("Chip Version", str(info.chip_version))
-            table.add_row("Generation", str(info.generation))
-            table.add_row("Total Chips", str(count // chip_type.value.devices_per_chip))
-            table.add_row("Physical Cores per Chip", str(info.chip_version.num_physical_tensor_cores_per_chip))
-            table.add_row("Megacore Mode", "Yes" if info.is_megacore else "No")
-            table.add_row("Supports Megacore", "Yes" if info.chip_version.supports_megacore else "No")
-            table.add_row("Num Cores (Logical)", str(info.num_cores))
-            table.add_row("Num Lanes (per Core)", str(info.num_lanes))
-            table.add_row("Num Sublanes (per Core)", str(info.num_sublanes))
-            table.add_row("MXU Column Size (per Core)", str(info.mxu_column_size))
-            table.add_row("VMEM Capacity (per Core)", fmt_bytes(info.vmem_capacity_bytes))
-            table.add_row("CMEM Capacity (per Core)", fmt_bytes(info.cmem_capacity_bytes))
-            table.add_row("SMEM Capacity (per Core)", fmt_bytes(info.smem_capacity_bytes))
-            table.add_row("HBM Capacity (per Core)", fmt_bytes(info.hbm_capacity_bytes))
-            table.add_row("Memory Bandwidth (per Core)", f"{fmt_bytes(info.mem_bw_bytes_per_second)}/s")
-            table.add_row("BF16 Ops (per Core)", fmt_ops(info.bf16_ops_per_second))
-            table.add_row("INT8 Ops (per Core)", fmt_ops(info.int8_ops_per_second))
-            table.add_row("FP8 Ops (per Core)", fmt_ops(info.fp8_ops_per_second))
-            table.add_row("INT4 Ops (per Core)", fmt_ops(info.int4_ops_per_second))
-            
-            if info.sparse_core:
-                table.add_row("Sparse Core", f"Cores: {info.sparse_core.num_cores}, Subcores: {info.sparse_core.num_subcores}, Lanes: {info.sparse_core.num_lanes}, DMA Granule: {info.sparse_core.dma_granule_size_bytes} B")
-                
-            return table
-        except Exception as e:
-            table = Table(box=box.ROUNDED, expand=True)
-            table.add_column("Error", style="red")
-            table.add_row(f"Failed to get TPU info: {e}")
-            return table
-
-    @work(thread=True)
-    def collect_metrics_worker(self) -> None:
-        while self.is_running:
-            try:
-                metrics_data = self.collector.collect_metrics()
-                self.call_from_thread(self.update_ui, metrics_data)
-            except Exception as e:
-                pass
-            time.sleep(0.5)
-
-    def _update_graph(self, widget_id: str, panel_title: str, header_str: str, history_data: list, color: str, width: int, timeline: str):
-        """Helper to update a graph panel to avoid repeated logic."""
-        bars = vertical_bar_chart(history_data, width=width, height=3)
-        text = Text(header_str, style=f"bold {color}")
-        for line in bars:
-            text.append(line + "\n", style=color)
-        text.append(timeline, style=color)
-        
-        self.query_one(widget_id, Static).update(
-            Panel(text, title=panel_title, box=box.ROUNDED, border_style=color)
+    def _apply_palette(self) -> None:
+        if not self._setup_done:
+            return
+        variables = self.theme_variables
+        self.palette = build_palette(
+            background=variables.get("background"),
+            foreground=variables.get("foreground"),
+            primary=variables.get("primary"),
+            dark=self.current_theme.dark,
         )
+        border = ("round", self.palette.faint)
+        self.devices_panel.styles.border = border
+        self.processes_panel.styles.border = border
+        for graph in self.graph_views.values():
+            graph.apply_palette(self.palette)
+        self._render_all()
+
+    # --------------------------------------------------------------- metrics
+
+    @work(thread=True, exclusive=True, group="metrics")
+    def collect_metrics_worker(self) -> None:
+        worker = get_current_worker()
+        while not worker.is_cancelled and not self._stop.is_set():
+            started = time.monotonic()
+            if not self.paused:
+                try:
+                    message: Message = MetricsReady(self.collector.collect_metrics())
+                except Exception as e:
+                    message = MetricsFailed(str(e) or type(e).__name__)
+                try:
+                    self.post_message(message)
+                except RuntimeError:
+                    break  # The app is shutting down.
+            self._stop.wait(max(0.05, self.interval - (time.monotonic() - started)))
+
+    def on_metrics_ready(self, message: MetricsReady) -> None:
+        if self.paused:
+            return
+        self.update_ui(message.data)
+
+    def on_metrics_failed(self, message: MetricsFailed) -> None:
+        self.last_error = message.error
+        self._render_all()
 
     def update_ui(self, metrics_data: Dict[str, Any]) -> None:
         # Update history
+        self.history.tick(time.monotonic())
         self.history.append_cpu(metrics_data["cpu_usage"])
         self.history.append_ram(metrics_data["ram_usage"]["percent"])
-        
+
         devices = metrics_data["devices"]
-        num_devices = len(devices)
-        avg_util = sum(d["tensorcore_util"] for d in devices) / len(devices) if devices else 0
-        avg_duty_cycle = sum(d["duty_cycle"] for d in devices) / len(devices) if devices else 0
-        avg_mem_pct = sum(d["memory_usage"] / d["total_memory"] * 100 for d in devices) / len(devices) if devices else 0
-        total_hbm_gb = sum(d["total_memory"] for d in devices) / (1024**3) if devices else 0.0
-        total_ram_gb = metrics_data['ram_usage']['total'] / (1024**3)
-        
+        n = len(devices)
+        avg_util = sum(d["tensorcore_util"] for d in devices) / n if n else 0.0
+        avg_duty_cycle = sum(d["duty_cycle"] for d in devices) / n if n else 0.0
+        avg_mem_pct = sum(_mem_pct(d) for d in devices) / n if n else 0.0
         self.history.append_tpu_util(avg_util)
         self.history.append_tpu_mem(avg_mem_pct)
         self.history.append_tpu_duty_cycle(avg_duty_cycle)
+        for d in devices:
+            self.history.append_chip(d["id"], d["tensorcore_util"], d["duty_cycle"], _mem_pct(d))
 
-        # Dynamic Layout Logic based on height
-        graphs_container = self.query_one("#graphs-container", Grid)
-        if self.console.height < 55:
-            graphs_container.add_class("row-layout")
-            col_width = self.console.width // 5
-        else:
-            graphs_container.remove_class("row-layout")
-            col_width = self.console.width // 2
+        chips_changed = self.last_data is None or len(self.last_data["devices"]) != n
+        self.last_data = metrics_data
+        self.last_error = ""
+        if chips_changed:
+            self._update_layout()
+        self._render_all()
 
-        # Update Banner
-        header_text = Text(f"TPU-TOP - TPU Utilization Monitor ({self.tpu_topology})", justify="center", style="bold green")
-        header_text.append(f"\ntpu-top: {self.tpu_top_version} | libtpu: {self.libtpu_version} | tpu-info: {self.tpu_info_version}", style="dim")
-        
-        self.query_one("#header-container", Static).update(Panel(header_text, box=box.ROUNDED))
+    # ------------------------------------------------------------- rendering
 
-        # Update Devices Table
-        dev_table = make_device_table(devices, metrics_data["hlo_map"], metrics_data["devices_per_chip"])
-        self.query_one("#devices-container", Static).update(Panel(dev_table, title="Devices", box=box.ROUNDED))
+    @property
+    def _state(self) -> str:
+        if self.paused:
+            return "paused"
+        if self.last_error:
+            return "error"
+        if self.last_data is None:
+            return "starting"
+        return "live"
 
-        # Update Graphs
-        graph_width = max(10, col_width - 6)
-        timeline_str = make_timeline(graph_width)
+    def _render_all(self) -> None:
+        if not self._setup_done:
+            return
+        self._render_header()
+        self._render_devices()
+        self._render_graphs()
+        self._render_processes()
 
-        # CPU
-        cpu_count = psutil.cpu_count() or 1
-        self._update_graph("#cpu-graph", "AVG CPU Activity", f"CPU ({cpu_count} cores): {metrics_data['cpu_usage']:5.1f}%\n", self.history.cpu, "#4285F4", graph_width, timeline_str)
-        
-        # TPU Util
-        self._update_graph("#tpu-util-graph", "AVG TPU (TC) UTL", f"UTL ({num_devices} Chips): {avg_util:5.1f}%\n", self.history.tpu_util, "#34A853", graph_width, timeline_str)
-        
-        # RAM
-        self._update_graph("#ram-graph", "RAM Usage", f"RAM ({total_ram_gb:.1f} GB): {metrics_data['ram_usage']['percent']:5.1f}%\n", self.history.ram, "#EA4335", graph_width, timeline_str)
-        
-        # TPU Mem
-        self._update_graph("#tpu-mem-graph", "AVG TPU Mem", f"HBM ({total_hbm_gb:.1f} GB): {avg_mem_pct:5.1f}%\n", self.history.tpu_mem, "#FBBC05", graph_width, timeline_str)
+    def _render_header(self) -> None:
+        data = self.last_data
+        summary = ""
+        if data and data["devices"]:
+            chips = len(data["devices"])
+            cores = chips * max(1, data.get("devices_per_chip", 1))
+            summary = f"{chips} chip{'s' if chips != 1 else ''}"
+            if cores != chips:
+                summary += f" · {cores} cores"
+        versions: List[Tuple[str, str]] = [
+            (name, version)
+            for name, version in (
+                ("libtpu", self.libtpu_version),
+                ("tpu-info", self.tpu_info_version),
+                ("tpu-top", self.tpu_top_version),
+            )
+            if version and version != "--"
+        ]
+        self.header_bar.show(
+            self.palette,
+            topology=self.tpu_topology,
+            summary=summary,
+            host=self.host_name,
+            versions=versions,
+            state=self._state,
+            mock=self.use_mock,
+            interval=self.interval,
+        )
 
-        # Duty Cycle
-        if self.console.height < 55:
-            dc_graph_width = graph_width
-            dc_timeline_str = timeline_str
-        else:
-            dc_graph_width = max(10, self.console.width - 6)
-            dc_timeline_str = make_timeline(dc_graph_width)
-            
-        self._update_graph("#duty-cycle-container", "AVG TPU DUTY CYCLE", f"DC ({num_devices} Chips): {avg_duty_cycle:5.1f}%\n", self.history.tpu_duty_cycle, "#E066FF", dc_graph_width, dc_timeline_str)
-
-        # Update Processes Table
-        current_pid = os.getpid()
-        processes = [p for p in metrics_data["processes"] if p["pid"] != current_pid]
-        processes = [p for p in processes if "tpu-top" not in p["name"] and "tputop" not in p["name"]]
-        
-        tpu_procs = [p for p in processes if "TPU" in p["device"]]
-        cpu_procs = [p for p in processes if p["device"] == "CPU"]
-        
-        tpu_procs.sort(key=lambda x: (int(x["device"].split()[1]), -x["memory"]))
-        cpu_procs.sort(key=lambda x: x["memory"], reverse=True)
-        
-        processes = tpu_procs + cpu_procs
-
-        if self.show_info:
-            info_table = self.get_tpu_info_table()
-            if info_table:
-                self.query_one("#processes-container", Static).update(Panel(info_table, title="TPU Info", box=box.ROUNDED))
+    def _render_devices(self) -> None:
+        p = self.palette
+        panel = self.devices_panel
+        panel.border_title = Text(" Devices ", style=f"bold {p.text}")
+        data = self.last_data
+        if data is None:
+            panel.border_subtitle = None
+            if self.last_error:
+                hint = "Run tpu-top on a Cloud TPU VM or GKE TPU pod, or try `tpu-top --mock`."
+                panel.update(
+                    Group(
+                        Text(f"Couldn't read TPU metrics: {self.last_error}", style=f"bold {p.bad}"),
+                        Text(hint, style=p.muted),
+                    )
+                )
             else:
-                self.query_one("#processes-container", Static).update(Panel(Text("TPU Info not available", style="red"), title="TPU Info", box=box.ROUNDED))
-        else:
-            proc_table = make_process_table(processes)
-            self.query_one("#processes-container", Static).update(Panel(proc_table, title="Processes", box=box.ROUNDED))
+                panel.update(Text("Waiting for TPU metrics…", style=p.muted))
+            return
 
-def main():
-    use_mock = not HAS_TPU_INFO or os.environ.get("TPU_TOP_MOCK") == "1"
-    app = TpuTopApp(use_mock=use_mock)
+        devices = data["devices"]
+        used = sum(d["memory_usage"] for d in devices) / GIB
+        total = sum(d["total_memory"] for d in devices) / GIB
+        panel.border_subtitle = Text(f" HBM {used:.1f} / {total:.1f} GiB ", style=p.muted) if devices else None
+        table = make_device_table(
+            devices,
+            data["hlo_map"],
+            data["devices_per_chip"],
+            palette=p,
+            history=self.history,
+            compact=self.compact,
+            narrow=self.terminal_size.width < 110,
+        )
+        panel.update(table)
+
+    def _render_graphs(self) -> None:
+        data = self.last_data
+        h = self.history
+        period = h.sample_period or self.interval
+        n = len(data["devices"]) if data else 0
+        chips = (f"avg of {n} chips", f"{n} chips") if n > 1 else ("", "")
+
+        hbm = ram = ("", "")
+        if data:
+            used = sum(d["memory_usage"] for d in data["devices"]) / GIB
+            total = sum(d["total_memory"] for d in data["devices"]) / GIB
+            if total:
+                hbm = (f"{used:.1f} / {total:.1f} GiB", f"of {total:.0f} GiB")
+            ram_total = data["ram_usage"].get("total", 0) / GIB
+            ram_used = ram_total * data["ram_usage"]["percent"] / 100
+            if ram_total:
+                ram = (f"{ram_used:.1f} / {ram_total:.1f} GiB", f"of {ram_total:.0f} GiB")
+
+        cores = f"{psutil.cpu_count() or 1} cores"
+        for graph_id, series, (detail, short_detail) in (
+            ("tc-graph", h.tpu_util, chips),
+            ("dc-graph", h.tpu_duty_cycle, chips),
+            ("hbm-graph", h.tpu_mem, hbm),
+            ("cpu-graph", h.cpu, (cores, cores)),
+            ("ram-graph", h.ram, ram),
+        ):
+            self.graph_views[graph_id].show(series, detail, period, self.graph_style, short_detail)
+
+    def _render_processes(self) -> None:
+        p = self.palette
+        panel = self.processes_panel
+        table = self.process_table
+        rows = []
+        if self.last_data:
+            rows = build_process_rows(
+                self.last_data["processes"],
+                cpu_count=psutil.cpu_count() or 1,
+                exclude_pids={os.getpid()},
+            )
+        tpu_rows = sum(1 for r in rows if r.on_tpu)
+        title = Text.assemble((" Processes ", f"bold {p.text}"))
+        if rows:
+            title.append(f"{tpu_rows} on TPU · {len(rows) - tpu_rows} busy on CPU ", style=p.muted)
+        panel.border_title = title
+        panel.border_subtitle = Text.assemble(
+            (" sort ", p.muted), (table.sort_mode, f"bold {p.text}"), ("  s ", p.faint)
+        )
+        table.show(rows, p)
+
+    # --------------------------------------------------------------- layout
+
+    def on_resize(self, event: events.Resize) -> None:
+        # Newer Textual versions update `App.size` after a short delay, so use
+        # the size carried by the event.
+        self._terminal_size = event.size
+        if not self._setup_done:
+            return
+        self._update_layout()
+        self._render_all()
+        # Render again once the widgets have their new sizes (graph labels depend on them).
+        self.set_timer(0.3, self._render_all)
+
+    @property
+    def terminal_size(self) -> Size:
+        return self._terminal_size or self.size
+
+    def _update_layout(self) -> None:
+        """Pick the richest layout that still leaves room for the process list."""
+        height = self.terminal_size.height
+        data = self.last_data
+        chips = len(data["devices"]) if data else 4
+        cores = max(1, data.get("devices_per_chip", 1)) if data else 1
+        # Devices panel: borders, header and rule, then the chip rows.
+        devices_full = 4 + chips * max(2, cores)
+        devices_compact = 4 + chips
+
+        # (one line per chip, graph layout, graph height, process rows to keep)
+        options = (
+            (False, "split", 14, PROCESSES_MIN_ROWS),
+            (False, "row", 7, 8),
+            (False, "short", 6, 8),
+            (True, "row", 7, 8),
+            (True, "short", 6, 6),
+        )
+        for compact, mode, graphs_height, process_rows in options:
+            devices = devices_compact if compact else devices_full
+            if 1 + devices + graphs_height + process_rows + 1 <= height:
+                break
+        else:
+            compact, mode = True, "hidden"
+
+        self.compact = compact
+        graphs = self.graphs_box
+        graphs.set_class(mode != "split", "row")
+        graphs.set_class(mode == "short", "short")
+        graphs.display = mode != "hidden"
+
+    # -------------------------------------------------------------- actions
+
+    async def action_quit(self) -> None:
+        self._stop.set()
+        self.exit()
+
+    def action_toggle_pause(self) -> None:
+        self.paused = not self.paused
+        if not self.paused:
+            self.history.reset_clock()
+        self._render_header()
+
+    def action_toggle_graph_style(self) -> None:
+        self.graph_style = "block" if self.graph_style == "braille" else "braille"
+        self._render_graphs()
+        self.notify(f"Graph style: {'blocks' if self.graph_style == 'block' else 'braille'}", timeout=2)
+
+    def action_cycle_sort(self) -> None:
+        self.process_table.cycle_sort()
+        self._render_processes()
+
+    def on_process_table_sort_changed(self, _message: ProcessTable.SortChanged) -> None:
+        self._render_processes()
+
+    def action_help(self) -> None:
+        if isinstance(self.screen, HelpScreen):
+            self.screen.dismiss()
+            return
+        self.push_screen(HelpScreen(make_help(self.palette), "Help"))
+
+    def action_toggle_info(self) -> None:
+        """Toggle the display of TPU info."""
+        if isinstance(self.screen, InfoScreen):
+            self.screen.dismiss()
+            return
+        if self._hardware_info is not None:
+            self._show_hardware_info(self._hardware_info)
+            return
+        self.notify("Reading TPU hardware info…", timeout=2)
+        self._load_hardware_info()
+
+    def action_default_view(self) -> None:
+        """Return to the default view (close any dialog)."""
+        if isinstance(self.screen, (InfoScreen, HelpScreen)):
+            self.screen.dismiss()
+
+    @work(thread=True, exclusive=True, group="hardware")
+    def _load_hardware_info(self) -> None:
+        try:
+            message = HardwareInfoReady(collect_hardware_info())
+        except HardwareInfoUnavailable as e:
+            message = HardwareInfoReady(None, str(e))
+        except Exception as e:
+            message = HardwareInfoReady(None, f"Failed to get TPU info: {e}")
+        self.post_message(message)
+
+    def on_hardware_info_ready(self, message: HardwareInfoReady) -> None:
+        if message.sections is not None:
+            self._hardware_info = message
+        self._show_hardware_info(message)
+
+    def _show_hardware_info(self, info: HardwareInfoReady) -> None:
+        p = self.palette
+        if info.sections is not None:
+            body: Any = make_info_sheet(info.sections, p)
+        else:
+            body = Group(
+                Text("TPU info not available", style=f"bold {p.bad}"),
+                Text(info.error, style=p.muted),
+            )
+        if not isinstance(self.screen, InfoScreen):
+            self.push_screen(InfoScreen(body, f"{self.tpu_topology} · hardware"))
+
+
+def _mem_pct(device: Dict[str, Any]) -> float:
+    total = device.get("total_memory") or 0
+    return device["memory_usage"] / total * 100 if total > 0 else 0.0
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="tpu-top",
+        description="Live TPU and host monitoring for Cloud TPU VMs and GKE pods.",
+    )
+    parser.add_argument(
+        "-n",
+        "--interval",
+        type=float,
+        default=0.5,
+        help="seconds between updates (default: 0.5)",
+    )
+    parser.add_argument(
+        "--mock",
+        action="store_true",
+        help="show simulated data; no TPU needed (same as TPU_TOP_MOCK=1)",
+    )
+    parser.add_argument(
+        "-V", "--version", action="version", version=f"%(prog)s {_package_version('tpu-top')}"
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None):
+    args = parse_args(argv)
+    mock_requested = args.mock or os.environ.get("TPU_TOP_MOCK") == "1"
+    use_mock = mock_requested or not HAS_TPU_INFO
+    app = TpuTopApp(use_mock=use_mock, interval=max(0.1, args.interval), mock_requested=mock_requested)
     app.run()
+
 
 if __name__ == "__main__":
     main()
