@@ -171,6 +171,7 @@ class MetricsCollector:
     def __init__(self, use_mock: bool = False):
         self.use_mock = use_mock
         self._prev_cpu_times = None
+        self._use_new_chip_usage = False
         self.process_cache = {}
         self._mock = _MockTPU() if use_mock else None
 
@@ -289,10 +290,13 @@ class MetricsCollector:
 
     def _get_chip_usage(self, chip_type) -> List[Any]:
         try:
+            if self._use_new_chip_usage and hasattr(metrics, "get_chip_usage_new"):
+                return metrics.get_chip_usage_new(chip_type)
             try:
                 return metrics.get_chip_usage(chip_type)
             except AssertionError:
                 if hasattr(metrics, "get_chip_usage_new"):
+                    self._use_new_chip_usage = True
                     return metrics.get_chip_usage_new(chip_type)
         except Exception as e:
             logger.warning(f"Failed to get chip usage: {e}")
@@ -315,7 +319,8 @@ class MetricsCollector:
             core_states = metrics.get_tpuz_info(include_hlo_info=True)
             for cs in core_states:
                 if cs.sequencer_states:
-                    loc = cs.sequencer_states[0].hlo_location or "N/A"
+                    raw_loc = cs.sequencer_states[0].hlo_location
+                    loc = raw_loc if raw_loc and raw_loc != "no HLO mapping" else "N/A"
                     if cs.chip_id not in hlo_map:
                         hlo_map[cs.chip_id] = {}
                     
@@ -328,6 +333,8 @@ class MetricsCollector:
                         core_label = f"C{cs.core_on_chip_index}"
                         
                     hlo_map[cs.chip_id][core_label] = loc
+            if hlo_map and 0 not in hlo_map:
+                hlo_map = {idx: hlo_map[cid] for idx, cid in enumerate(sorted(hlo_map))}
         except Exception as e:
             logger.warning(f"Failed to get HLO info: {e}")
         return hlo_map

@@ -318,7 +318,7 @@ def parse_hlo_location(location: Optional[str]) -> Tuple[str, str]:
     Locations look like ``"HLO: fusion.12; HLO computation: main.579_spmd"``.
     Anything else is returned as the op name.
     """
-    if not location or location == "N/A":
+    if not location or location in ("N/A", "no HLO mapping"):
         return "", ""
     match = _HLO_RE.match(location)
     if match:
