@@ -615,6 +615,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[List[str]] = None):
     args = parse_args(argv)
+    if os.environ.get("TERM") != "dumb":
+        os.environ.setdefault("COLORTERM", "truecolor")
     mock_requested = args.mock or os.environ.get("TPU_TOP_MOCK") == "1"
     use_mock = mock_requested or not HAS_TPU_INFO
     app = TpuTopApp(
