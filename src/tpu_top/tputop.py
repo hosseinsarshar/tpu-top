@@ -81,6 +81,7 @@ class TpuTopApp(App):
         Binding("space", "toggle_pause", "Pause", show=False),
         Binding("s", "cycle_sort", "Sort"),
         Binding("g", "toggle_graph_style", "Graph style"),
+        Binding("t", "change_theme", "Theme"),
         Binding("question_mark", "help", "Help"),
         Binding("escape", "default_view", "Default view", show=False),
     ]
@@ -150,11 +151,18 @@ class TpuTopApp(App):
     }
     """
 
-    def __init__(self, use_mock: bool = False, interval: float = 0.5, mock_requested: bool = True):
+    def __init__(
+        self,
+        use_mock: bool = False,
+        interval: float = 0.5,
+        mock_requested: bool = True,
+        initial_theme: str = THEME_NAME,
+    ):
         super().__init__()
         self.use_mock = use_mock
         self.mock_requested = mock_requested
         self.interval = interval
+        self.initial_theme = initial_theme or THEME_NAME
         self.collector = MetricsCollector(use_mock=use_mock)
         self.history = MetricsHistory()
         self.palette: Palette = build_palette()
@@ -196,7 +204,7 @@ class TpuTopApp(App):
         self.process_table = self.query_one(ProcessTable)
 
         self.register_theme(TPU_TOP_THEME)
-        self.theme = THEME_NAME
+        self.theme = self.initial_theme if self.initial_theme in self.available_themes else THEME_NAME
         self.theme_changed_signal.subscribe(self, lambda _theme: self._apply_palette())
 
         # Set up versions for header
@@ -589,6 +597,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="seconds between updates (default: 0.5)",
     )
     parser.add_argument(
+        "-t",
+        "--theme",
+        default=os.environ.get("TPU_TOP_THEME", THEME_NAME),
+        help=f"color theme name, e.g. {THEME_NAME}, dracula, nord, tokyo-night, textual-light",
+    )
+    parser.add_argument(
         "--mock",
         action="store_true",
         help="show simulated data; no TPU needed (same as TPU_TOP_MOCK=1)",
@@ -603,7 +617,12 @@ def main(argv: Optional[List[str]] = None):
     args = parse_args(argv)
     mock_requested = args.mock or os.environ.get("TPU_TOP_MOCK") == "1"
     use_mock = mock_requested or not HAS_TPU_INFO
-    app = TpuTopApp(use_mock=use_mock, interval=max(0.1, args.interval), mock_requested=mock_requested)
+    app = TpuTopApp(
+        use_mock=use_mock,
+        interval=max(0.1, args.interval),
+        mock_requested=mock_requested,
+        initial_theme=args.theme,
+    )
     app.run()
 
 

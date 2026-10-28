@@ -385,6 +385,7 @@ def make_help(palette: Palette) -> RenderableType:
         ("p / space", "Pause or resume updates"),
         ("s", "Change process sort order (or click a column header)"),
         ("g", "Switch graph style (braille / blocks)"),
+        ("t", "Change color theme (live preview)"),
         ("↑ ↓ PgUp PgDn", "Scroll the process list"),
         ("ctrl+p", "Command palette (change theme, ...)"),
         ("?", "This help"),
